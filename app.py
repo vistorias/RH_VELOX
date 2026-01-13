@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Painel de RH — Template replicável por marca (multi-meses)
+# (SEM oauth2client) -> usa google-auth
 # ============================================================
 
-import os, io, json, re, unicodedata, calendar
+import io, re, unicodedata
 from datetime import datetime, date
 from typing import Optional, Tuple, Dict
 
@@ -13,14 +14,12 @@ import numpy as np
 import altair as alt
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
-from google.oauth2 import service_account as gcreds
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 
-# ------------------ CONFIG BÁSICA ------------------
+# ------------------ CONFIG ------------------
 st.set_page_config(page_title="Painel de RH", layout="wide")
 st.title("Painel de RH")
 
@@ -46,28 +45,23 @@ hr{border:0;border-top:1px solid #e5e7eb;margin:18px 0}
 fast_mode = st.toggle("Modo rápido (pular gráficos/tabelas pesadas)", value=False)
 
 
-# ------------------ CREDENCIAL ------------------
+# ------------------ AUTH (google-auth) ------------------
 def _get_client_and_drive():
-    try:
-        block = st.secrets["gcp_service_account"]
-    except Exception:
+    if "gcp_service_account" not in st.secrets:
         st.error("Não encontrei [gcp_service_account] no secrets.toml.")
         st.stop()
 
-    info = dict(block)
+    info = dict(st.secrets["gcp_service_account"])
 
     scopes = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+
+    creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(creds)
 
-    dscopes = ["https://www.googleapis.com/auth/drive.readonly"]
-    gcred = gcreds.Credentials.from_service_account_info(info, scopes=dscopes)
-    drive = build("drive", "v3", credentials=gcred, cache_discovery=False)
-
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     return gc, drive
 
 
@@ -156,9 +150,7 @@ def _drive_download_bytes(file_id: str) -> bytes:
 def _safe_read_excel(content: bytes, sheet_name: str) -> pd.DataFrame:
     try:
         df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine="openpyxl")
-        if df is None:
-            return pd.DataFrame()
-        return df
+        return df if df is not None else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -192,7 +184,7 @@ def read_rh_month(file_id: str, ym: Optional[str]) -> Tuple[Dict[str, pd.DataFra
     title = meta.get("name", file_id)
     mime = meta.get("mimeType", "")
 
-    tabs = ["BASE GERAL", "BASE PRESENÇA", "ABSENTEISMO E TURNOVER", "TREINAMENTOS", "VELOX"]
+    tabs = ["BASE GERAL", "BASE PRESENÇA", "ABSENTEISMO E TURNOVER", "TREINAMENTOS"]
     out: Dict[str, pd.DataFrame] = {}
 
     if mime == "application/vnd.google-apps.spreadsheet":
@@ -202,15 +194,12 @@ def read_rh_month(file_id: str, ym: Optional[str]) -> Tuple[Dict[str, pd.DataFra
             if not df.empty:
                 out[t] = df.copy()
     else:
-        if not (mime.startswith("application/vnd.openxmlformats-officedocument") or mime.startswith("application/vnd.ms-excel")):
-            raise RuntimeError(f"Tipo de arquivo não suportado: {mime} ({title})")
         content = _drive_download_bytes(file_id)
         for t in tabs:
             df = _safe_read_excel(content, t)
             if not df.empty:
                 out[t] = df.copy()
 
-    # padronizações por aba
     for k, df in list(out.items()):
         df.columns = [str(c).strip() for c in df.columns]
         df["YM"] = ym or ""
@@ -228,7 +217,7 @@ if idx.empty:
     st.stop()
 
 packs = []
-ok, fail = [], []
+fail = []
 
 for _, r in idx.iterrows():
     sid = _sheet_id(r.get("URL", ""))
@@ -236,19 +225,17 @@ for _, r in idx.iterrows():
     if not sid:
         continue
     try:
-        pack, ttl = read_rh_month(sid, ym=ym)
+        pack, _ = read_rh_month(sid, ym=ym)
         packs.append(pack)
-        ok.append(f"{r.get('MÊS','')} — {ttl}")
     except Exception as e:
-        fail.append((sid, e))
+        fail.append((sid, str(e)))
 
 if not packs:
     st.error("Não consegui ler nenhum mês do RH a partir do índice.")
     if fail:
         with st.expander("Falhas (debug)"):
-            for sid, e in fail:
-                st.write(sid)
-                st.exception(e)
+            for sid, msg in fail:
+                st.write(sid, msg)
     st.stop()
 
 
@@ -269,7 +256,6 @@ df_presenca   = _concat_from_packs("BASE PRESENÇA")
 df_abs_turn   = _concat_from_packs("ABSENTEISMO E TURNOVER")
 df_treinos    = _concat_from_packs("TREINAMENTOS")
 
-# Normalizações mínimas (para filtros)
 def _ensure_cols(df: pd.DataFrame, mapping: Dict[str, Tuple[str, ...]]) -> pd.DataFrame:
     if df.empty:
         return df
@@ -282,7 +268,6 @@ def _ensure_cols(df: pd.DataFrame, mapping: Dict[str, Tuple[str, ...]]) -> pd.Da
             df[std] = ""
     return df
 
-# BASE GERAL: tenta padronizar colunas comuns
 df_base_geral = _ensure_cols(df_base_geral, {
     "COLABORADOR": ("NOME", "NOME COMPLETO", "FUNCIONARIO", "FUNCIONÁRIO"),
     "EMPRESA": ("MARCA",),
@@ -293,6 +278,7 @@ df_base_geral = _ensure_cols(df_base_geral, {
     "DATA_DESLIGAMENTO": ("DESLIGAMENTO", "DATA DE DESLIGAMENTO", "DATADESLIGAMENTO"),
     "TEMPO_CASA": ("PERFIL", "NOVATO/VETERANO"),
 })
+
 if not df_base_geral.empty:
     df_base_geral["EMPRESA"] = df_base_geral["EMPRESA"].astype(str).map(_upper)
     df_base_geral["UNIDADE"] = df_base_geral["UNIDADE"].astype(str).map(_upper)
@@ -302,7 +288,6 @@ if not df_base_geral.empty:
     df_base_geral["DATA_ADMISSAO"] = df_base_geral["DATA_ADMISSAO"].apply(parse_date_any)
     df_base_geral["DATA_DESLIGAMENTO"] = df_base_geral["DATA_DESLIGAMENTO"].apply(parse_date_any)
 
-# PRESENÇA
 df_presenca = _ensure_cols(df_presenca, {
     "COLABORADOR": ("NOME", "FUNCIONARIO", "FUNCIONÁRIO"),
     "EMPRESA": ("MARCA",),
@@ -316,7 +301,6 @@ if not df_presenca.empty:
     df_presenca["DATA"] = df_presenca["DATA"].apply(parse_date_any)
     df_presenca["STATUS_PRESENCA"] = df_presenca["STATUS_PRESENCA"].astype(str).map(_upper)
 
-# ABSENTEÍSMO E TURNOVER
 df_abs_turn = _ensure_cols(df_abs_turn, {
     "EMPRESA": ("MARCA",),
     "UNIDADE": ("CIDADE",),
@@ -331,7 +315,6 @@ if not df_abs_turn.empty:
     df_abs_turn["TIPO"] = df_abs_turn["TIPO"].astype(str).map(_upper)
     df_abs_turn["QTD"] = pd.to_numeric(df_abs_turn["QTD"], errors="coerce").fillna(0).astype(int)
 
-# TREINAMENTOS
 df_treinos = _ensure_cols(df_treinos, {
     "COLABORADOR": ("NOME", "FUNCIONARIO", "FUNCIONÁRIO"),
     "EMPRESA": ("MARCA",),
@@ -348,8 +331,7 @@ if not df_treinos.empty:
     df_treinos["DATA"] = df_treinos["DATA"].apply(parse_date_any)
 
 
-# ------------------ FILTROS (topo) ------------------
-# Meses disponíveis
+# ------------------ FILTROS ------------------
 months = sorted([m for m in pd.unique(
     pd.concat([
         df_base_geral.get("YM", pd.Series([], dtype=str)),
@@ -376,7 +358,6 @@ ym_sel = label_map[sel_label]
 
 c1, c2, c3 = st.columns([1.4, 1.4, 1.8])
 
-# Opções
 emp_opts = []
 if "EMPRESA" in df_base_geral.columns and not df_base_geral.empty:
     emp_opts = sorted([e for e in df_base_geral["EMPRESA"].dropna().unique().tolist() if str(e).strip()])
@@ -391,6 +372,7 @@ with c1:
 unid_opts = []
 if "UNIDADE" in df_base_geral.columns and not df_base_geral.empty:
     unid_opts = sorted([u for u in df_base_geral["UNIDADE"].dropna().unique().tolist() if str(u).strip()])
+
 with c2:
     f_unid = st.multiselect("Unidade/Cidade", options=unid_opts, default=unid_opts)
 
@@ -418,8 +400,7 @@ ab = _apply_filters(df_abs_turn)
 tr = _apply_filters(df_treinos)
 
 
-# ------------------ KPIs (cards) ------------------
-# Colaboradores ativos (se houver coluna SITUACAO)
+# ------------------ KPIs ------------------
 if not bg.empty:
     sit = bg["SITUACAO"].astype(str).map(_upper) if "SITUACAO" in bg.columns else pd.Series([""] * len(bg))
     ativos = bg[~sit.str.contains(r"DESLIG|INAT", regex=True, na=False)].copy()
@@ -428,7 +409,6 @@ else:
 
 total_colab = int(ativos["COLABORADOR"].nunique()) if (not ativos.empty and "COLABORADOR" in ativos.columns) else 0
 
-# admissões/desligamentos do mês (se tiver datas)
 def _is_in_month(d: date, ym: str) -> bool:
     try:
         y, m = ym.split("-")
@@ -444,18 +424,14 @@ if not bg.empty:
     if "DATA_DESLIGAMENTO" in bg.columns:
         desl = int(sum(_is_in_month(d, ym_sel) for d in bg["DATA_DESLIGAMENTO"].tolist()))
 
-# turnover % (fórmula que você usa)
 turnover_pct = np.nan
 if total_colab > 0:
     turnover_pct = (((admis + desl) / 2) / total_colab) * 100
-
 turnover_str = "—" if np.isnan(turnover_pct) else f"{turnover_pct:.1f}%".replace(".", ",")
 
-# absenteísmo (se tiver base própria: tenta inferir)
 abs_pct = np.nan
 abs_note = "—"
 if not pr.empty and "STATUS_PRESENCA" in pr.columns:
-    # entende como falta qualquer status contendo FALTA/AUSÊNCI/ATESTADO (ajuste fino depois)
     stt = pr["STATUS_PRESENCA"].astype(str).map(_upper)
     total_reg = len(pr)
     faltas = int(stt.str.contains(r"FALTA|AUSEN|AUSÊN|ATEST", regex=True, na=False).sum())
@@ -464,7 +440,6 @@ if not pr.empty and "STATUS_PRESENCA" in pr.columns:
         abs_note = f"{faltas} de {total_reg}"
 abs_str = "—" if np.isnan(abs_pct) else f"{abs_pct:.1f}%".replace(".", ",")
 
-# treinamentos concluídos
 treinos_total = int(len(tr)) if not tr.empty else 0
 treinos_ok = 0
 if not tr.empty and "STATUS" in tr.columns:
@@ -508,10 +483,8 @@ st.markdown(cards_html, unsafe_allow_html=True)
 # ------------------ ABAS ------------------
 tab1, tab2, tab3, tab4 = st.tabs(["Visão geral", "Turnover/Absenteísmo", "Treinamentos", "Detalhes"])
 
-# ---------- VISÃO GERAL ----------
 with tab1:
     st.markdown('<div class="section">Distribuição</div>', unsafe_allow_html=True)
-
     cA, cB = st.columns(2)
 
     with cA:
@@ -542,75 +515,8 @@ with tab1:
         else:
             st.info("Sem dados suficientes para 'Top cargos'.")
 
-    if not fast_mode:
-        st.markdown('<div class="section">Movimentações do mês</div>', unsafe_allow_html=True)
-
-        mov = []
-        if not bg.empty and "COLABORADOR" in bg.columns:
-            if "DATA_ADMISSAO" in bg.columns:
-                a = bg[bg["DATA_ADMISSAO"].map(lambda d: _is_in_month(d, ym_sel))].copy()
-                if not a.empty:
-                    a["TIPO"] = "Admissão"
-                    mov.append(a[["COLABORADOR", "UNIDADE", "CARGO", "TIPO"]].copy())
-            if "DATA_DESLIGAMENTO" in bg.columns:
-                d = bg[bg["DATA_DESLIGAMENTO"].map(lambda x: _is_in_month(x, ym_sel))].copy()
-                if not d.empty:
-                    d["TIPO"] = "Desligamento"
-                    mov.append(d[["COLABORADOR", "UNIDADE", "CARGO", "TIPO"]].copy())
-        if mov:
-            movdf = pd.concat(mov, ignore_index=True)
-            st.dataframe(movdf, use_container_width=True, hide_index=True)
-        else:
-            st.info("Sem dados de admissões/desligamentos no mês (ou sem colunas de datas).")
-
-
-# ---------- TURNOVER / ABSENTEÍSMO ----------
 with tab2:
-    st.markdown('<div class="section">Turnover</div>', unsafe_allow_html=True)
-
-    # Série por mês (se tiver BG consolidado com datas)
-    if not df_base_geral.empty and "DATA_ADMISSAO" in df_base_geral.columns:
-        base_all = df_base_geral.copy()
-        if f_emp and "EMPRESA" in base_all.columns:
-            base_all = base_all[base_all["EMPRESA"].isin([_upper(x) for x in f_emp])]
-        if f_unid and "UNIDADE" in base_all.columns:
-            base_all = base_all[base_all["UNIDADE"].isin([_upper(x) for x in f_unid])]
-        if perfil_sel != "Todos" and "TEMPO_CASA" in base_all.columns:
-            alvo = "NOVATO" if perfil_sel == "Novatos" else "VETERANO"
-            base_all = base_all[base_all["TEMPO_CASA"] == alvo]
-
-        # cria coluna YM a partir de datas (quando existir)
-        def _ym_from_date(d):
-            return f"{d.year}-{d.month:02d}" if isinstance(d, date) else ""
-        base_all["_YM_ADM"] = base_all["DATA_ADMISSAO"].map(_ym_from_date) if "DATA_ADMISSAO" in base_all.columns else ""
-        base_all["_YM_DES"] = base_all["DATA_DESLIGAMENTO"].map(_ym_from_date) if "DATA_DESLIGAMENTO" in base_all.columns else ""
-
-        adm_s = base_all[base_all["_YM_ADM"] != ""].groupby("_YM_ADM")["COLABORADOR"].nunique().reset_index(name="ADM")
-        des_s = base_all[base_all["_YM_DES"] != ""].groupby("_YM_DES")["COLABORADOR"].nunique().reset_index(name="DES")
-
-        serie = adm_s.merge(des_s, left_on="_YM_ADM", right_on="_YM_DES", how="outer").fillna(0)
-        serie["YM"] = serie["_YM_ADM"].where(serie["_YM_ADM"] != "", serie["_YM_DES"])
-        serie = serie[["YM", "ADM", "DES"]].copy()
-        serie["ADM"] = serie["ADM"].astype(int)
-        serie["DES"] = serie["DES"].astype(int)
-        serie = serie.sort_values("YM")
-
-        # ativos por mês (proxy: usa ativos do mês (se existir YM em cada linha), senão usa o do filtro)
-        # para manter simples, usa o total do mês selecionado como denominador.
-        denom = max(total_colab, 1)
-        serie["TURNOVER_%"] = (((serie["ADM"] + serie["DES"]) / 2) / denom * 100).round(1)
-
-        ch = alt.Chart(serie).mark_line(point=True).encode(
-            x=alt.X("YM:N", title="MÊS"),
-            y=alt.Y("TURNOVER_%:Q", title="Turnover (%)"),
-            tooltip=["YM", "ADM", "DES", alt.Tooltip("TURNOVER_%:Q", format=".1f")]
-        ).properties(height=300)
-        st.altair_chart(ch, use_container_width=True)
-    else:
-        st.info("Sem base com DATA_ADMISSAO/DATA_DESLIGAMENTO suficiente para série histórica de Turnover.")
-
     st.markdown('<div class="section">Absenteísmo</div>', unsafe_allow_html=True)
-
     if not pr.empty and "DATA" in pr.columns and "STATUS_PRESENCA" in pr.columns:
         tmp = pr.copy()
         tmp["DIA"] = pd.to_datetime(tmp["DATA"], errors="coerce")
@@ -633,70 +539,32 @@ with tab2:
     else:
         st.info("Sem BASE PRESENÇA suficiente para calcular absenteísmo por dia.")
 
-
-# ---------- TREINAMENTOS ----------
 with tab3:
     st.markdown('<div class="section">Treinamentos do mês</div>', unsafe_allow_html=True)
-
     if tr.empty:
         st.info("Sem dados de TREINAMENTOS no mês/filtros.")
     else:
-        # por treinamento
         by_t = tr.groupby("TREINAMENTO")["COLABORADOR"].nunique().reset_index(name="PESSOAS")
         by_t = by_t.sort_values("PESSOAS", ascending=False).head(15)
 
-        c1, c2 = st.columns(2)
-
-        with c1:
-            ch = alt.Chart(by_t).mark_bar().encode(
-                x=alt.X("TREINAMENTO:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=220), title="TREINAMENTO"),
-                y=alt.Y("PESSOAS:Q", title="PESSOAS"),
-                tooltip=["TREINAMENTO", "PESSOAS"]
-            ).properties(height=320)
-            st.subheader("Top treinamentos (até 15)")
-            st.altair_chart(ch, use_container_width=True)
-
-        with c2:
-            # por unidade
-            if "UNIDADE" in tr.columns:
-                by_u = tr.groupby("UNIDADE")["COLABORADOR"].nunique().reset_index(name="PESSOAS")
-                by_u = by_u.sort_values("PESSOAS", ascending=False)
-                ch = alt.Chart(by_u).mark_bar().encode(
-                    x=alt.X("UNIDADE:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=220), title="UNIDADE"),
-                    y=alt.Y("PESSOAS:Q", title="PESSOAS"),
-                    tooltip=["UNIDADE", "PESSOAS"]
-                ).properties(height=320)
-                st.subheader("Participação por unidade")
-                st.altair_chart(ch, use_container_width=True)
-            else:
-                st.info("Sem UNIDADE em TREINAMENTOS.")
+        ch = alt.Chart(by_t).mark_bar().encode(
+            x=alt.X("TREINAMENTO:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=220), title="TREINAMENTO"),
+            y=alt.Y("PESSOAS:Q", title="PESSOAS"),
+            tooltip=["TREINAMENTO", "PESSOAS"]
+        ).properties(height=320)
+        st.altair_chart(ch, use_container_width=True)
 
         if not fast_mode:
-            st.markdown('<div class="section">Detalhamento (treinamentos)</div>', unsafe_allow_html=True)
             cols_show = [c for c in ["DATA","UNIDADE","COLABORADOR","CARGO","TREINAMENTO","STATUS"] if c in tr.columns]
-            st.dataframe(tr[cols_show].sort_values(cols_show[0] if cols_show else tr.columns[0]), use_container_width=True, hide_index=True)
+            if cols_show:
+                st.dataframe(tr[cols_show], use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(tr, use_container_width=True, hide_index=True)
 
-
-# ---------- DETALHES (base geral/presença/abs) ----------
 with tab4:
     st.markdown('<div class="section">Base Geral (recorte)</div>', unsafe_allow_html=True)
     if bg.empty:
         st.info("Sem dados em BASE GERAL no mês/filtros.")
     else:
         cols = [c for c in ["EMPRESA","UNIDADE","COLABORADOR","CARGO","SITUACAO","DATA_ADMISSAO","DATA_DESLIGAMENTO","TEMPO_CASA","YM"] if c in bg.columns]
-        st.dataframe(bg[cols].sort_values(["UNIDADE","COLABORADOR"]) if "UNIDADE" in bg.columns else bg[cols], use_container_width=True, hide_index=True)
-
-    if not fast_mode:
-        st.markdown('<div class="section">Presença (recorte)</div>', unsafe_allow_html=True)
-        if pr.empty:
-            st.info("Sem dados em BASE PRESENÇA no mês/filtros.")
-        else:
-            cols = [c for c in ["DATA","UNIDADE","COLABORADOR","STATUS_PRESENCA","YM"] if c in pr.columns]
-            st.dataframe(pr[cols].sort_values(["DATA","UNIDADE","COLABORADOR"]) if "DATA" in pr.columns else pr[cols], use_container_width=True, hide_index=True)
-
-        st.markdown('<div class="section">Absenteísmo/Turnover (recorte)</div>', unsafe_allow_html=True)
-        if ab.empty:
-            st.info("Sem dados em ABSENTEISMO E TURNOVER no mês/filtros.")
-        else:
-            cols = [c for c in ["DATA","EMPRESA","UNIDADE","TIPO","QTD","YM"] if c in ab.columns]
-            st.dataframe(ab[cols].sort_values(["DATA","TIPO"]) if "DATA" in ab.columns else ab[cols], use_container_width=True, hide_index=True)
+        st.dataframe(bg[cols] if cols else bg, use_container_width=True, hide_index=True)
