@@ -17,7 +17,7 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Painel RH - VELOX", layout="wide")
 
 # ✅ IMPORTANTE: aqui precisa ser URL COMPLETA (não apenas o ID)
-INDEX_SHEET_URL = "https://docs.google.com/spreadsheets/d/1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo"
+INDEX_SHEET_URL = "https://docs.google.com/spreadsheets/d/1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo/edit?gid=0#gid=0"
 
 # ✅ Nomes das abas (conforme seu padrão real)
 TAB_BASE_GERAL = "BASE GERAL"
@@ -638,3 +638,5 @@ with tab6:
 
     fig_tc = px.bar(agg.sort_values("TEMPO_CASA_MEDIA", ascending=False), x="GERENTE_RESPONSAVEL", y="TEMPO_CASA_MEDIA")
     st.plotly_chart(fig_tc, use_container_width=True)
+
+
