@@ -1,669 +1,702 @@
-import re
-from datetime import date
-from dateutil.relativedelta import relativedelta
+# -*- coding: utf-8 -*-
+# ============================================================
+# Painel de RH — Template replicável por marca (multi-meses)
+# ============================================================
 
-import numpy as np
-import pandas as pd
+import os, io, json, re, unicodedata, calendar
+from datetime import datetime, date
+from typing import Optional, Tuple, Dict
+
 import streamlit as st
-import plotly.express as px
+import pandas as pd
+import numpy as np
+import altair as alt
 
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(page_title="Painel RH - VELOX", layout="wide")
+from google.oauth2 import service_account as gcreds
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-# Pode ser ID ou URL do índice
-INDEX_SHEET_REF = "1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo"
 
-GERENTE_POR_CIDADE = {
-    "IMPERATRIZ": "Jorge Alexandre Bezerra da Costa",
-    "ESTREITO": "Jorge Alexandre Bezerra da Costa",
-    "SÃO LUIS": "Moisés Santos do Nascimento",
-    "SAO LUIS": "Moisés Santos do Nascimento",
-    "PEDREIRAS": "Moisés Santos do Nascimento",
-    "GRAJAÚ": "Moisés Santos do Nascimento",
-    "GRAJAU": "Moisés Santos do Nascimento",
-}
+# ------------------ CONFIG BÁSICA ------------------
+st.set_page_config(page_title="Painel de RH", layout="wide")
+st.title("Painel de RH")
 
-# Abas reais (conforme sua base)
-TAB_BASE_GERAL = "BASE GERAL"
-TAB_BASE_PRESENCA = "BASE PRESENÇA"
-TAB_TREINAMENTOS = "TREINAMENTOS"
-TAB_ABS_TURNOVER = "ABSENTEISMO E TURNOVER"
-
-INDEX_TAB_NAME = "Página1"  # sua planilha índice
-
-# =========================
-# HELPERS
-# =========================
-def extract_sheet_id(url_or_id: str) -> str:
-    if not isinstance(url_or_id, str):
-        return ""
-    s = url_or_id.strip()
-    if s.startswith("http"):
-        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
-        return m.group(1) if m else ""
-    return s  # já é um ID
-
-def norm_text(x):
-    if pd.isna(x):
-        return ""
-    s = str(x).strip()
-    s = s.replace("\u00a0", " ")
-    return s
-
-def norm_name(x):
-    s = norm_text(x).upper()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def norm_city(x):
-    s = norm_text(x).upper()
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("SAO LUIS", "SÃO LUIS")
-    s = s.replace("GRAJAU", "GRAJAÚ")
-    return s
-
-def parse_date_safe(x):
-    if pd.isna(x) or str(x).strip() == "":
-        return pd.NaT
-    return pd.to_datetime(x, dayfirst=True, errors="coerce")
-
-def month_start_end(mes_ref: str):
-    m, y = mes_ref.split("/")
-    y = int(y)
-    m = int(m)
-    start = date(y, m, 1)
-    end = (start + relativedelta(months=1)) - relativedelta(days=1)
-    return start, end
-
-def kpi_card(col, title, value, subtitle=None):
-    with col:
-        st.markdown(
-            f"""
-            <div style="border:1px solid #e6e6e6;border-radius:14px;padding:14px;">
-              <div style="font-size:12px;color:#666;margin-bottom:4px;">{title}</div>
-              <div style="font-size:26px;font-weight:700;line-height:1.1;">{value}</div>
-              <div style="font-size:12px;color:#666;margin-top:6px;">{subtitle or ""}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-def make_unique_columns(cols):
-    """Garante nomes únicos: se repetir, vira 'COL', 'COL__2', 'COL__3'..."""
-    seen = {}
-    out = []
-    for c in cols:
-        c0 = norm_text(c)
-        if c0 == "":
-            c0 = "COL"
-        if c0 not in seen:
-            seen[c0] = 1
-            out.append(c0)
-        else:
-            seen[c0] += 1
-            out.append(f"{c0}__{seen[c0]}")
-    return out
-
-def collapse_duplicate_columns(df: pd.DataFrame, base_name: str) -> pd.Series:
+st.markdown(
     """
-    Se houver colunas base_name, base_name__2, base_name__3...,
-    retorna uma Series com o primeiro valor não vazio por linha.
-    """
-    candidates = [c for c in df.columns if c == base_name or c.startswith(base_name + "__")]
-    if not candidates:
-        return pd.Series([np.nan] * len(df), index=df.index)
-
-    tmp = df[candidates].copy()
-
-    # transforma tudo em string "limpa" para identificar vazio
-    for c in candidates:
-        tmp[c] = tmp[c].apply(norm_text)
-
-    # pega primeiro não vazio
-    out = tmp[candidates[0]].copy()
-    for c in candidates[1:]:
-        mask = (out == "") | out.isna()
-        out.loc[mask] = tmp.loc[mask, c]
-    return out
-
-def ensure_numeric_series(s):
-    return pd.to_numeric(s, errors="coerce").fillna(0)
-
-def get_gspread_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-    return gspread.authorize(creds)
-
-def open_sheet(gc, url_or_id: str):
-    ref = str(url_or_id).strip()
-    if ref.startswith("http"):
-        return gc.open_by_url(ref)
-    return gc.open_by_key(ref)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def read_worksheet_as_df(sheet_ref: str, tab_name: str) -> pd.DataFrame:
-    gc = get_gspread_client()
-    sh = open_sheet(gc, sheet_ref)
-    ws = sh.worksheet(tab_name)
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        return pd.DataFrame()
-
-    header = values[0]
-    data = values[1:]
-    df = pd.DataFrame(data, columns=header)
-
-    # normaliza e garante colunas únicas
-    df.columns = make_unique_columns(df.columns)
-    return df
-
-@st.cache_data(ttl=600, show_spinner=False)
-def read_index_df(index_ref: str) -> pd.DataFrame:
-    df = read_worksheet_as_df(index_ref, INDEX_TAB_NAME)
-    if df.empty:
-        return df
-
-    # tenta detectar colunas (no seu print: URL | MÊS | ATIVO)
-    cols_upper = {c.upper(): c for c in df.columns}
-
-    url_col = cols_upper.get("URL_BASE") or cols_upper.get("URL")
-    mes_col = cols_upper.get("MES_REF") or cols_upper.get("MÊS") or cols_upper.get("MES")
-    ativo_col = cols_upper.get("ATIVO")
-
-    if not url_col or not mes_col or not ativo_col:
-        return df  # para você visualizar no app se necessário
-
-    out = df[[url_col, mes_col, ativo_col]].copy()
-    out.columns = ["URL_BASE", "MES_REF", "ATIVO"]
-
-    out["URL_BASE"] = out["URL_BASE"].apply(norm_text)
-    out["MES_REF"] = out["MES_REF"].apply(norm_text)
-    out["ATIVO"] = out["ATIVO"].apply(lambda x: norm_text(x).upper())
-
-    out["SHEET_ID"] = out["URL_BASE"].apply(extract_sheet_id)
-    return out
-
-def build_base_geral(df_bg: pd.DataFrame) -> pd.DataFrame:
-    if df_bg.empty:
-        return df_bg
-
-    # renomeia por heurística
-    colmap = {}
-    for c in df_bg.columns:
-        cu = c.upper()
-
-        if cu in ["NOME", "COLABORADOR", "FUNCIONARIO"]:
-            colmap[c] = "NOME"
-        elif cu in ["CIDADE", "UNIDADE"]:
-            colmap[c] = "CIDADE"
-        elif cu in ["FUNÇÃO", "FUNCAO", "CARGO"]:
-            colmap[c] = "FUNCAO"
-        elif cu in ["SUPERVISOR", "LIDER", "LÍDER"]:
-            colmap[c] = "SUPERVISOR"
-        elif cu.strip() == "STATUS":
-            colmap[c] = "STATUS"
-        elif "DT NASC" in cu or "NASC" in cu:
-            colmap[c] = "DT_NASCIMENTO"
-        elif "DT ADMIS" in cu or "ADMISS" in cu:
-            colmap[c] = "DT_ADMISSAO"
-        elif "DT DEMIS" in cu or "DEMISS" in cu:
-            colmap[c] = "DT_DEMISSAO"
-        elif "MOTIVO" in cu:
-            colmap[c] = "MOTIVO_DEMISSAO"
-        elif "DIAS ÚTEIS" in cu or "DIAS UTEIS" in cu:
-            colmap[c] = "DIAS_UTEIS"
-        elif cu.strip() == "E-MAIL" or cu.strip() == "EMAIL":
-            colmap[c] = "EMAIL"
-
-    df = df_bg.rename(columns=colmap).copy()
-
-    # ✅ consolida duplicadas que viraram DT_DEMISSAO__2 etc.
-    for base_col in ["DT_ADMISSAO", "DT_DEMISSAO", "DT_NASCIMENTO", "STATUS", "CIDADE", "NOME", "FUNCAO", "SUPERVISOR", "MOTIVO_DEMISSAO", "DIAS_UTEIS", "EMAIL"]:
-        if base_col in df.columns or any(c.startswith(base_col + "__") for c in df.columns):
-            df[base_col] = collapse_duplicate_columns(df, base_col)
-            # remove colunas duplicadas (mantém só a base_col)
-            drop_cols = [c for c in df.columns if c.startswith(base_col + "__")]
-            df = df.drop(columns=drop_cols, errors="ignore")
-
-    # normalizações
-    df["NOME_NORM"] = df["NOME"].apply(norm_name) if "NOME" in df.columns else ""
-    df["CIDADE"] = df["CIDADE"].apply(norm_city) if "CIDADE" in df.columns else ""
-
-    if "FUNCAO" in df.columns:
-        df["FUNCAO"] = df["FUNCAO"].apply(lambda x: norm_text(x).upper())
-        df["FUNCAO"] = df["FUNCAO"].str.replace("VISTORIADORA", "VISTORIADOR", regex=False)
-
-    if "STATUS" in df.columns:
-        df["STATUS"] = df["STATUS"].apply(lambda x: norm_text(x).upper())
-
-    df["GERENTE_RESPONSAVEL"] = df["CIDADE"].map(GERENTE_POR_CIDADE).fillna("Não mapeado")
-
-    # datas
-    for col in ["DT_ADMISSAO", "DT_DEMISSAO", "DT_NASCIMENTO"]:
-        if col in df.columns:
-            df[col] = df[col].apply(parse_date_safe)
-
-    return df
-
-def build_presenca(df_pres: pd.DataFrame) -> pd.DataFrame:
-    if df_pres.empty:
-        return df_pres
-
-    # detectar coluna nome
-    name_col = None
-    for c in df_pres.columns:
-        if c.upper() in ["NOME", "COLABORADOR", "FUNCIONARIO"]:
-            name_col = c
-            break
-    if not name_col:
-        name_col = df_pres.columns[0]
-
-    df = df_pres.copy()
-    df["NOME_NORM"] = df[name_col].apply(norm_name)
-
-    # colunas dia
-    day_cols = []
-    for c in df.columns:
-        cu = c.strip()
-        if cu.isdigit() and 1 <= int(cu) <= 31:
-            day_cols.append(c)
-        elif re.fullmatch(r"\d{2}", cu) and 1 <= int(cu) <= 31:
-            day_cols.append(c)
-
-    total_col = None
-    for c in df.columns:
-        if c.upper().strip() == "TOTAL":
-            total_col = c
-            break
-
-    if total_col:
-        df["FALTAS_TOTAL"] = ensure_numeric_series(df[total_col])
-    else:
-        if day_cols:
-            faltas = np.zeros(len(df))
-            for c in day_cols:
-                faltas += ensure_numeric_series(df[c]).to_numpy()
-            df["FALTAS_TOTAL"] = faltas
-        else:
-            df["FALTAS_TOTAL"] = 0
-
-    return df[["NOME_NORM", "FALTAS_TOTAL"]]
-
-def build_treinamentos(df_tr: pd.DataFrame) -> pd.DataFrame:
-    if df_tr.empty:
-        return df_tr
-
-    name_col = None
-    pres_col = None
-
-    for c in df_tr.columns:
-        cu = c.upper()
-        if cu in ["NOME", "COLABORADOR", "FUNCIONARIO"]:
-            name_col = c
-        if "PRESEN" in cu:
-            pres_col = c
-
-    if not name_col:
-        name_col = df_tr.columns[0]
-
-    df = df_tr.copy()
-    df["NOME_NORM"] = df[name_col].apply(norm_name)
-
-    if pres_col:
-        df["PRESENCA"] = df[pres_col].apply(lambda x: norm_text(x).upper())
-    else:
-        df["PRESENCA"] = ""
-
-    df["PRESENCA_OK"] = df["PRESENCA"].isin(["SIM", "S", "OK", "PRESENTE"])
-    return df[["NOME_NORM", "PRESENCA_OK"]]
-
-def compute_metrics(df_base: pd.DataFrame, df_pres: pd.DataFrame, df_tr: pd.DataFrame, mes_ref: str):
-    headcount = len(df_base)
-
-    if "STATUS" in df_base.columns:
-        status_norm = df_base["STATUS"].astype(str).str.upper().str.strip()
-        ativos = int((status_norm == "ATIVO").sum())
-    else:
-        ativos = headcount
-    desligados_total = headcount - ativos
-
-    start, end = month_start_end(mes_ref)
-
-    entradas = 0
-    saidas = 0
-
-    if "DT_ADMISSAO" in df_base.columns:
-        adm = pd.to_datetime(df_base["DT_ADMISSAO"], errors="coerce", dayfirst=True)
-        entradas = int(((adm.dt.date >= start) & (adm.dt.date <= end)).sum())
-
-    if "DT_DEMISSAO" in df_base.columns:
-        dem = pd.to_datetime(df_base["DT_DEMISSAO"], errors="coerce", dayfirst=True)
-        saidas = int(((dem.dt.date >= start) & (dem.dt.date <= end)).sum())
-
-    turnover = (((entradas + saidas) / 2) / headcount * 100) if headcount else 0
-
-    faltas_total = float(df_pres["FALTAS_TOTAL"].sum()) if (df_pres is not None and not df_pres.empty) else 0.0
-
-    dias_uteis = 22
-    if "DIAS_UTEIS" in df_base.columns:
-        du = pd.to_numeric(df_base["DIAS_UTEIS"], errors="coerce").dropna()
-        if len(du) > 0:
-            dias_uteis = int(float(du.iloc[0]))
-
-    abs_pct = (faltas_total / (headcount * dias_uteis) * 100) if headcount and dias_uteis else 0
-
-    if df_tr is not None and not df_tr.empty and "PRESENCA_OK" in df_tr.columns:
-        pres_ok = int(df_tr["PRESENCA_OK"].sum())
-        treino_pct = pres_ok / headcount * 100 if headcount else 0
-    else:
-        pres_ok = 0
-        treino_pct = 0
-
-    return {
-        "headcount": headcount,
-        "ativos": ativos,
-        "desligados_total": desligados_total,
-        "entradas": entradas,
-        "saidas": saidas,
-        "turnover_pct": turnover,
-        "faltas_total": faltas_total,
-        "dias_uteis": dias_uteis,
-        "abs_pct": abs_pct,
-        "treino_presencas": pres_ok,
-        "treino_pct": treino_pct,
-        "periodo_inicio": start,
-        "periodo_fim": end,
-    }
-
-def add_age_tenure(df: pd.DataFrame, ref_date: date):
-    out = df.copy()
-
-    if "DT_NASCIMENTO" in out.columns:
-        dn = pd.to_datetime(out["DT_NASCIMENTO"], errors="coerce", dayfirst=True)
-        out["IDADE"] = (pd.to_datetime(ref_date) - dn).dt.days / 365.25
-    else:
-        out["IDADE"] = np.nan
-
-    if "DT_ADMISSAO" in out.columns:
-        da = pd.to_datetime(out["DT_ADMISSAO"], errors="coerce", dayfirst=True)
-        out["TEMPO_CASA_ANOS"] = (pd.to_datetime(ref_date) - da).dt.days / 365.25
-    else:
-        out["TEMPO_CASA_ANOS"] = np.nan
-
-    def faixa_idade(x):
-        if pd.isna(x):
-            return "Sem dado"
-        if x < 18:
-            return "<18 (inconsistente)"
-        if x <= 24:
-            return "18–24"
-        if x <= 29:
-            return "25–29"
-        if x <= 34:
-            return "30–34"
-        if x <= 39:
-            return "35–39"
-        return "40+"
-
-    def faixa_tempo(x):
-        if pd.isna(x):
-            return "Sem dado"
-        if x < 0:
-            return "Inconsistente"
-        if x < 0.25:
-            return "<3 meses"
-        if x < 0.5:
-            return "3–6 meses"
-        if x < 1:
-            return "6–12 meses"
-        if x < 2:
-            return "1–2 anos"
-        if x < 5:
-            return "2–5 anos"
-        return "5+ anos"
-
-    out["FAIXA_IDADE"] = out["IDADE"].apply(faixa_idade)
-    out["FAIXA_TEMPO_CASA"] = out["TEMPO_CASA_ANOS"].apply(faixa_tempo)
-    return out
-
-def quality_alerts(df_base: pd.DataFrame, df_tr: pd.DataFrame):
-    alerts = []
-    if "FAIXA_IDADE" in df_base.columns:
-        bad_age = df_base[df_base["FAIXA_IDADE"] == "<18 (inconsistente)"]
-        if len(bad_age) > 0:
-            alerts.append(f"Idade inconsistente: {len(bad_age)} registro(s) com idade < 18.")
-    if df_tr is not None and not df_tr.empty:
-        base_names = set(df_base["NOME_NORM"].tolist()) if "NOME_NORM" in df_base.columns else set()
-        tr_names = set(df_tr["NOME_NORM"].tolist()) if "NOME_NORM" in df_tr.columns else set()
-        extra = tr_names - base_names
-        if len(extra) > 0:
-            alerts.append(f"Treinamento com nomes fora da base: {len(extra)} (ex.: {sorted(list(extra))[:3]}).")
-    return alerts
-
-# =========================
-# UI
-# =========================
-st.title("Painel de RH - VELOX Vistorias")
-
-with st.sidebar:
-    st.subheader("Controle")
-    st.caption("O painel lê a planilha ÍNDICE e puxa a base do mês selecionado.")
-    st.divider()
-
-idx = read_index_df(INDEX_SHEET_REF)
-
-if idx.empty or not set(["URL_BASE", "MES_REF", "ATIVO"]).issubset(set(idx.columns)):
-    st.error("A aba do índice não está no formato esperado. Precisa de colunas: URL, MÊS, ATIVO.")
-    st.dataframe(idx)
-    st.stop()
-
-ativos_idx = idx[idx["ATIVO"] == "S"].copy()
-if ativos_idx.empty:
-    st.error("Não há meses com ATIVO = S no índice.")
-    st.dataframe(idx)
-    st.stop()
-
-mes_opts = ativos_idx["MES_REF"].tolist()
-mes_sel = st.sidebar.selectbox("Mês de referência", mes_opts, index=len(mes_opts) - 1)
-
-row = ativos_idx[ativos_idx["MES_REF"] == mes_sel].iloc[0]
-base_ref = row["URL_BASE"]  # pode ser URL
-
-# debug útil (pode remover depois)
-with st.sidebar:
-    st.caption("Valor vindo do índice:")
-    st.write(base_ref)
-    st.caption("ID extraído:")
-    st.write(extract_sheet_id(base_ref))
-
-with st.spinner("Carregando base do mês..."):
-    df_bg_raw = read_worksheet_as_df(base_ref, TAB_BASE_GERAL)
-    df_pr_raw = read_worksheet_as_df(base_ref, TAB_BASE_PRESENCA)
-    df_tr_raw = read_worksheet_as_df(base_ref, TAB_TREINAMENTOS)
-
-df_base = build_base_geral(df_bg_raw)
-df_pres = build_presenca(df_pr_raw)
-df_tr = build_treinamentos(df_tr_raw)
-
-df = df_base.merge(df_pres, on="NOME_NORM", how="left")
-df["FALTAS_TOTAL"] = df["FALTAS_TOTAL"].fillna(0)
-df = df.merge(df_tr, on="NOME_NORM", how="left")
-df["PRESENCA_OK"] = df["PRESENCA_OK"].fillna(False)
-
-start, end = month_start_end(mes_sel)
-df = add_age_tenure(df, end)
-
-with st.sidebar:
-    st.subheader("Filtros")
-    cidades = sorted([c for c in df.get("CIDADE", pd.Series()).dropna().unique().tolist() if str(c).strip() != ""])
-    funcoes = sorted([f for f in df.get("FUNCAO", pd.Series()).dropna().unique().tolist() if str(f).strip() != ""])
-    gerentes = sorted([g for g in df.get("GERENTE_RESPONSAVEL", pd.Series()).dropna().unique().tolist() if str(g).strip() != ""])
-
-    f_cidade = st.multiselect("Cidade", cidades, default=cidades)
-    f_funcao = st.multiselect("Função", funcoes, default=funcoes)
-    f_gerente = st.multiselect("Gerente", gerentes, default=gerentes)
-    f_status = st.multiselect("Status", ["ATIVO", "DESLIGADO"], default=["ATIVO", "DESLIGADO"])
-
-df_f = df[
-    df["CIDADE"].isin(f_cidade)
-    & df["FUNCAO"].isin(f_funcao)
-    & df["GERENTE_RESPONSAVEL"].isin(f_gerente)
-    & df["STATUS"].isin(f_status)
-].copy()
-
-metrics = compute_metrics(
-    df_f,
-    df_f[["NOME_NORM", "FALTAS_TOTAL"]] if "FALTAS_TOTAL" in df_f.columns else pd.DataFrame(),
-    df_f[["NOME_NORM", "PRESENCA_OK"]] if "PRESENCA_OK" in df_f.columns else pd.DataFrame(),
-    mes_sel,
+<style>
+.card-wrap{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0 6px;}
+.card{background:#f7f7f9;border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.06);padding:14px 16px;min-width:220px;flex:1;text-align:center}
+.card h4{margin:0 0 6px;font-size:14px;color:#0f172a;font-weight:700}
+.card h2{margin:0;font-size:26px;font-weight:900;color:#111827}
+.card .sub{margin-top:8px;display:inline-block;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:700}
+.sub.ok{background:#e8f5ec;color:#197a31;border:1px solid #cce9d4}
+.sub.bad{background:#fdeaea;color:#a31616;border:1px solid #f2cccc}
+.sub.neu{background:#f1f1f4;color:#444;border:1px solid #e4e4e8}
+.section{font-size:18px;font-weight:900;margin:20px 0 8px;color:#0f172a}
+.small{color:#6b7280;font-size:13px}
+hr{border:0;border-top:1px solid #e5e7eb;margin:18px 0}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-st.subheader(f"Visão Geral | {mes_sel}")
+fast_mode = st.toggle("Modo rápido (pular gráficos/tabelas pesadas)", value=False)
 
-c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-kpi_card(c1, "Headcount", f"{metrics['headcount']}", f"Período {metrics['periodo_inicio']} a {metrics['periodo_fim']}")
-kpi_card(c2, "Ativos", f"{metrics['ativos']}", None)
-kpi_card(c3, "Desligados", f"{metrics['desligados_total']}", None)
-kpi_card(c4, "Entradas", f"{metrics['entradas']}", None)
-kpi_card(c5, "Saídas", f"{metrics['saidas']}", None)
-kpi_card(c6, "Turnover", f"{metrics['turnover_pct']:.2f}%", "((entradas+saídas)/2)/headcount")
-kpi_card(c7, "Absenteísmo", f"{metrics['abs_pct']:.2f}%", f"Faltas: {int(metrics['faltas_total'])} | Dias úteis: {metrics['dias_uteis']}")
-kpi_card(c8, "Treinamento", f"{metrics['treino_pct']:.2f}%", f"Presenças: {metrics['treino_presencas']}")
 
-alerts = quality_alerts(df_f, df_tr)
-if alerts:
-    st.warning("Alertas de qualidade de dados:\n\n- " + "\n- ".join(alerts))
+# ------------------ CREDENCIAL ------------------
+def _get_client_and_drive():
+    try:
+        block = st.secrets["gcp_service_account"]
+    except Exception:
+        st.error("Não encontrei [gcp_service_account] no secrets.toml.")
+        st.stop()
 
-st.divider()
+    info = dict(block)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Composição do Time",
-    "Perfil (Idade e Tempo de Casa)",
-    "Absenteísmo",
-    "Turnover",
-    "Treinamentos",
-    "Gerencial (Jorge x Moisés)"
-])
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
+    gc = gspread.authorize(creds)
 
+    dscopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    gcred = gcreds.Credentials.from_service_account_info(info, scopes=dscopes)
+    drive = build("drive", "v3", credentials=gcred, cache_discovery=False)
+
+    return gc, drive
+
+
+client, DRIVE = _get_client_and_drive()
+
+RH_INDEX_ID = st.secrets.get("rh_index_sheet_id", "").strip()
+BRAND_NAME = st.secrets.get("rh_brand_name", "").strip().upper()
+
+if not RH_INDEX_ID:
+    st.error("Faltou `rh_index_sheet_id` no secrets.toml.")
+    st.stop()
+
+
+# ------------------ HELPERS ------------------
+ID_RE = re.compile(r"/d/([a-zA-Z0-9-_]+)")
+
+def _sheet_id(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    m = ID_RE.search(s)
+    if m:
+        return m.group(1)
+    return s if re.fullmatch(r"[A-Za-z0-9-_]{20,}", s) else None
+
+def _upper(x):
+    return str(x).upper().strip() if pd.notna(x) else ""
+
+def _yes(v) -> bool:
+    return str(v).strip().upper() in {"S", "SIM", "Y", "YES", "TRUE", "1"}
+
+def _strip_accents(s: str) -> str:
+    if s is None: return ""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(ch))
+
+def _norm_col(s: str) -> str:
+    return re.sub(r"\W+", "", _strip_accents(str(s)).upper())
+
+def _find_col(cols, *names) -> Optional[str]:
+    norm = {_norm_col(c): c for c in cols}
+    for nm in names:
+        key = _norm_col(nm)
+        if key in norm:
+            return norm[key]
+    return None
+
+def parse_date_any(x):
+    if pd.isna(x) or x == "":
+        return pd.NaT
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        try:
+            return (pd.to_datetime("1899-12-30") + pd.to_timedelta(int(x), unit="D")).date()
+        except Exception:
+            pass
+    s = str(x).strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(s).date()
+    except Exception:
+        return pd.NaT
+
+def _ym_token(x: str) -> Optional[str]:
+    if not x: return None
+    s = str(x).strip()
+    if re.fullmatch(r"\d{2}/\d{4}", s):
+        mm, yy = s.split("/")
+        return f"{yy}-{int(mm):02d}"
+    if re.fullmatch(r"\d{4}-\d{2}", s):
+        return s
+    return None
+
+def _drive_get_file_metadata(file_id: str) -> dict:
+    return DRIVE.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+
+def _drive_download_bytes(file_id: str) -> bytes:
+    req = DRIVE.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req, chunksize=1024 * 1024)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+def _safe_read_excel(content: bytes, sheet_name: str) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine="openpyxl")
+        if df is None:
+            return pd.DataFrame()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def _safe_read_gsheet(sh, tab: str) -> pd.DataFrame:
+    try:
+        ws = sh.worksheet(tab)
+        rows = ws.get_all_records()
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+# ------------------ ÍNDICE (cache) ------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def read_index(sheet_id: str, tab: str = "ARQUIVOS") -> pd.DataFrame:
+    sh = client.open_by_key(sheet_id)
+    ws = sh.worksheet(tab)
+    rows = ws.get_all_records()
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["URL", "MÊS", "ATIVO"])
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    for need in ["URL", "MÊS", "ATIVO"]:
+        if need not in df.columns:
+            df[need] = ""
+    return df
+
+
+# ------------------ LEITURA DE UM MÊS RH (cache) ------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def read_rh_month(file_id: str, ym: Optional[str]) -> Tuple[Dict[str, pd.DataFrame], str]:
+    meta = _drive_get_file_metadata(file_id)
+    title = meta.get("name", file_id)
+    mime = meta.get("mimeType", "")
+
+    tabs = ["BASE GERAL", "BASE PRESENÇA", "ABSENTEISMO E TURNOVER", "TREINAMENTOS", "VELOX"]
+    out: Dict[str, pd.DataFrame] = {}
+
+    if mime == "application/vnd.google-apps.spreadsheet":
+        sh = client.open_by_key(file_id)
+        for t in tabs:
+            df = _safe_read_gsheet(sh, t)
+            if not df.empty:
+                out[t] = df.copy()
+    else:
+        if not (mime.startswith("application/vnd.openxmlformats-officedocument") or mime.startswith("application/vnd.ms-excel")):
+            raise RuntimeError(f"Tipo de arquivo não suportado: {mime} ({title})")
+        content = _drive_download_bytes(file_id)
+        for t in tabs:
+            df = _safe_read_excel(content, t)
+            if not df.empty:
+                out[t] = df.copy()
+
+    # padronizações por aba
+    for k, df in list(out.items()):
+        df.columns = [str(c).strip() for c in df.columns]
+        df["YM"] = ym or ""
+        out[k] = df
+
+    return out, title
+
+
+# ------------------ CARREGAR MESES ATIVOS ------------------
+idx = read_index(RH_INDEX_ID)
+idx = idx[idx["ATIVO"].map(_yes)].copy()
+
+if idx.empty:
+    st.error("Seu índice está vazio ou sem meses ATIVOS.")
+    st.stop()
+
+packs = []
+ok, fail = [], []
+
+for _, r in idx.iterrows():
+    sid = _sheet_id(r.get("URL", ""))
+    ym = _ym_token(r.get("MÊS", ""))
+    if not sid:
+        continue
+    try:
+        pack, ttl = read_rh_month(sid, ym=ym)
+        packs.append(pack)
+        ok.append(f"{r.get('MÊS','')} — {ttl}")
+    except Exception as e:
+        fail.append((sid, e))
+
+if not packs:
+    st.error("Não consegui ler nenhum mês do RH a partir do índice.")
+    if fail:
+        with st.expander("Falhas (debug)"):
+            for sid, e in fail:
+                st.write(sid)
+                st.exception(e)
+    st.stop()
+
+
+# ------------------ CONSOLIDAÇÃO ------------------
+def _concat_from_packs(tab_name: str) -> pd.DataFrame:
+    frames = []
+    for pack in packs:
+        if tab_name in pack and isinstance(pack[tab_name], pd.DataFrame) and not pack[tab_name].empty:
+            frames.append(pack[tab_name])
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+df_base_geral = _concat_from_packs("BASE GERAL")
+df_presenca   = _concat_from_packs("BASE PRESENÇA")
+df_abs_turn   = _concat_from_packs("ABSENTEISMO E TURNOVER")
+df_treinos    = _concat_from_packs("TREINAMENTOS")
+
+# Normalizações mínimas (para filtros)
+def _ensure_cols(df: pd.DataFrame, mapping: Dict[str, Tuple[str, ...]]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cols = list(df.columns)
+    for std, aliases in mapping.items():
+        c = _find_col(cols, std, *aliases)
+        if c and c != std:
+            df = df.rename(columns={c: std})
+        if std not in df.columns:
+            df[std] = ""
+    return df
+
+# BASE GERAL: tenta padronizar colunas comuns
+df_base_geral = _ensure_cols(df_base_geral, {
+    "COLABORADOR": ("NOME", "NOME COMPLETO", "FUNCIONARIO", "FUNCIONÁRIO"),
+    "EMPRESA": ("MARCA",),
+    "UNIDADE": ("CIDADE", "FILIAL"),
+    "CARGO": ("FUNCAO", "FUNÇÃO"),
+    "SITUACAO": ("STATUS",),
+    "DATA_ADMISSAO": ("ADMISSAO", "DATA DE ADMISSÃO", "DATAADMISSAO"),
+    "DATA_DESLIGAMENTO": ("DESLIGAMENTO", "DATA DE DESLIGAMENTO", "DATADESLIGAMENTO"),
+    "TEMPO_CASA": ("PERFIL", "NOVATO/VETERANO"),
+})
+if not df_base_geral.empty:
+    df_base_geral["EMPRESA"] = df_base_geral["EMPRESA"].astype(str).map(_upper)
+    df_base_geral["UNIDADE"] = df_base_geral["UNIDADE"].astype(str).map(_upper)
+    df_base_geral["CARGO"] = df_base_geral["CARGO"].astype(str).map(_upper)
+    df_base_geral["SITUACAO"] = df_base_geral["SITUACAO"].astype(str).map(_upper)
+    df_base_geral["TEMPO_CASA"] = df_base_geral["TEMPO_CASA"].astype(str).map(_upper)
+    df_base_geral["DATA_ADMISSAO"] = df_base_geral["DATA_ADMISSAO"].apply(parse_date_any)
+    df_base_geral["DATA_DESLIGAMENTO"] = df_base_geral["DATA_DESLIGAMENTO"].apply(parse_date_any)
+
+# PRESENÇA
+df_presenca = _ensure_cols(df_presenca, {
+    "COLABORADOR": ("NOME", "FUNCIONARIO", "FUNCIONÁRIO"),
+    "EMPRESA": ("MARCA",),
+    "UNIDADE": ("CIDADE",),
+    "DATA": ("DIA",),
+    "STATUS_PRESENCA": ("STATUS", "PRESENCA", "PRESENÇA"),
+})
+if not df_presenca.empty:
+    df_presenca["EMPRESA"] = df_presenca["EMPRESA"].astype(str).map(_upper)
+    df_presenca["UNIDADE"] = df_presenca["UNIDADE"].astype(str).map(_upper)
+    df_presenca["DATA"] = df_presenca["DATA"].apply(parse_date_any)
+    df_presenca["STATUS_PRESENCA"] = df_presenca["STATUS_PRESENCA"].astype(str).map(_upper)
+
+# ABSENTEÍSMO E TURNOVER
+df_abs_turn = _ensure_cols(df_abs_turn, {
+    "EMPRESA": ("MARCA",),
+    "UNIDADE": ("CIDADE",),
+    "DATA": ("DIA", "PERIODO"),
+    "TIPO": ("TIPO_EVENTO", "EVENTO"),
+    "QTD": ("QUANTIDADE",),
+})
+if not df_abs_turn.empty:
+    df_abs_turn["EMPRESA"] = df_abs_turn["EMPRESA"].astype(str).map(_upper)
+    df_abs_turn["UNIDADE"] = df_abs_turn["UNIDADE"].astype(str).map(_upper)
+    df_abs_turn["DATA"] = df_abs_turn["DATA"].apply(parse_date_any)
+    df_abs_turn["TIPO"] = df_abs_turn["TIPO"].astype(str).map(_upper)
+    df_abs_turn["QTD"] = pd.to_numeric(df_abs_turn["QTD"], errors="coerce").fillna(0).astype(int)
+
+# TREINAMENTOS
+df_treinos = _ensure_cols(df_treinos, {
+    "COLABORADOR": ("NOME", "FUNCIONARIO", "FUNCIONÁRIO"),
+    "EMPRESA": ("MARCA",),
+    "UNIDADE": ("CIDADE",),
+    "TREINAMENTO": ("CURSO", "TEMA"),
+    "DATA": ("DIA",),
+    "STATUS": ("SITUACAO",),
+})
+if not df_treinos.empty:
+    df_treinos["EMPRESA"] = df_treinos["EMPRESA"].astype(str).map(_upper)
+    df_treinos["UNIDADE"] = df_treinos["UNIDADE"].astype(str).map(_upper)
+    df_treinos["TREINAMENTO"] = df_treinos["TREINAMENTO"].astype(str).str.strip()
+    df_treinos["STATUS"] = df_treinos["STATUS"].astype(str).map(_upper)
+    df_treinos["DATA"] = df_treinos["DATA"].apply(parse_date_any)
+
+
+# ------------------ FILTROS (topo) ------------------
+# Meses disponíveis
+months = sorted([m for m in pd.unique(
+    pd.concat([
+        df_base_geral.get("YM", pd.Series([], dtype=str)),
+        df_presenca.get("YM", pd.Series([], dtype=str)),
+        df_abs_turn.get("YM", pd.Series([], dtype=str)),
+        df_treinos.get("YM", pd.Series([], dtype=str)),
+    ], ignore_index=True).astype(str)
+) if m and m != "nan"])
+
+if not months:
+    st.error("Não encontrei YM (MÊS) nos dados consolidados.")
+    st.stop()
+
+def _label_from_ym(ym: str) -> str:
+    try:
+        y, m = ym.split("-")
+        return f"{int(m):02d}/{y}"
+    except Exception:
+        return ym
+
+label_map = {_label_from_ym(m): m for m in months}
+sel_label = st.selectbox("Mês de referência", options=list(label_map.keys()), index=len(months)-1)
+ym_sel = label_map[sel_label]
+
+c1, c2, c3 = st.columns([1.4, 1.4, 1.8])
+
+# Opções
+emp_opts = []
+if "EMPRESA" in df_base_geral.columns and not df_base_geral.empty:
+    emp_opts = sorted([e for e in df_base_geral["EMPRESA"].dropna().unique().tolist() if str(e).strip()])
+
+with c1:
+    if emp_opts:
+        default_emp = [BRAND_NAME] if BRAND_NAME and BRAND_NAME in emp_opts else emp_opts
+        f_emp = st.multiselect("Empresa/Marca", options=emp_opts, default=default_emp)
+    else:
+        f_emp = []
+
+unid_opts = []
+if "UNIDADE" in df_base_geral.columns and not df_base_geral.empty:
+    unid_opts = sorted([u for u in df_base_geral["UNIDADE"].dropna().unique().tolist() if str(u).strip()])
+with c2:
+    f_unid = st.multiselect("Unidade/Cidade", options=unid_opts, default=unid_opts)
+
+with c3:
+    perfil_sel = st.radio("Perfil (tempo de casa)", ["Todos", "Novatos", "Veteranos"], horizontal=True)
+
+def _apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "YM" in out.columns:
+        out = out[out["YM"].astype(str) == str(ym_sel)]
+    if f_emp and "EMPRESA" in out.columns:
+        out = out[out["EMPRESA"].isin([_upper(x) for x in f_emp])]
+    if f_unid and "UNIDADE" in out.columns:
+        out = out[out["UNIDADE"].isin([_upper(x) for x in f_unid])]
+    if perfil_sel != "Todos" and "TEMPO_CASA" in out.columns:
+        alvo = "NOVATO" if perfil_sel == "Novatos" else "VETERANO"
+        out = out[out["TEMPO_CASA"] == alvo]
+    return out
+
+bg = _apply_filters(df_base_geral)
+pr = _apply_filters(df_presenca)
+ab = _apply_filters(df_abs_turn)
+tr = _apply_filters(df_treinos)
+
+
+# ------------------ KPIs (cards) ------------------
+# Colaboradores ativos (se houver coluna SITUACAO)
+if not bg.empty:
+    sit = bg["SITUACAO"].astype(str).map(_upper) if "SITUACAO" in bg.columns else pd.Series([""] * len(bg))
+    ativos = bg[~sit.str.contains(r"DESLIG|INAT", regex=True, na=False)].copy()
+else:
+    ativos = bg.copy()
+
+total_colab = int(ativos["COLABORADOR"].nunique()) if (not ativos.empty and "COLABORADOR" in ativos.columns) else 0
+
+# admissões/desligamentos do mês (se tiver datas)
+def _is_in_month(d: date, ym: str) -> bool:
+    try:
+        y, m = ym.split("-")
+        return isinstance(d, date) and d.year == int(y) and d.month == int(m)
+    except Exception:
+        return False
+
+admis = 0
+desl = 0
+if not bg.empty:
+    if "DATA_ADMISSAO" in bg.columns:
+        admis = int(sum(_is_in_month(d, ym_sel) for d in bg["DATA_ADMISSAO"].tolist()))
+    if "DATA_DESLIGAMENTO" in bg.columns:
+        desl = int(sum(_is_in_month(d, ym_sel) for d in bg["DATA_DESLIGAMENTO"].tolist()))
+
+# turnover % (fórmula que você usa)
+turnover_pct = np.nan
+if total_colab > 0:
+    turnover_pct = (((admis + desl) / 2) / total_colab) * 100
+
+turnover_str = "—" if np.isnan(turnover_pct) else f"{turnover_pct:.1f}%".replace(".", ",")
+
+# absenteísmo (se tiver base própria: tenta inferir)
+abs_pct = np.nan
+abs_note = "—"
+if not pr.empty and "STATUS_PRESENCA" in pr.columns:
+    # entende como falta qualquer status contendo FALTA/AUSÊNCI/ATESTADO (ajuste fino depois)
+    stt = pr["STATUS_PRESENCA"].astype(str).map(_upper)
+    total_reg = len(pr)
+    faltas = int(stt.str.contains(r"FALTA|AUSEN|AUSÊN|ATEST", regex=True, na=False).sum())
+    if total_reg > 0:
+        abs_pct = faltas / total_reg * 100
+        abs_note = f"{faltas} de {total_reg}"
+abs_str = "—" if np.isnan(abs_pct) else f"{abs_pct:.1f}%".replace(".", ",")
+
+# treinamentos concluídos
+treinos_total = int(len(tr)) if not tr.empty else 0
+treinos_ok = 0
+if not tr.empty and "STATUS" in tr.columns:
+    treinos_ok = int(tr["STATUS"].astype(str).map(_upper).isin(["CONCLUIDO", "CONCLUÍDO", "OK", "REALIZADO", "SIM"]).sum())
+
+cards_html = f"""
+<div class="card-wrap">
+  <div class='card'>
+    <h4>Colaboradores ativos</h4>
+    <h2>{total_colab:,}</h2>
+    <span class='sub neu'>mês: {sel_label}</span>
+  </div>
+  <div class='card'>
+    <h4>Admissões (mês)</h4>
+    <h2>{admis:,}</h2>
+  </div>
+  <div class='card'>
+    <h4>Desligamentos (mês)</h4>
+    <h2>{desl:,}</h2>
+  </div>
+  <div class='card'>
+    <h4>Turnover (mês)</h4>
+    <h2>{turnover_str}</h2>
+    <span class='sub neu'>((adm+desl)/2)/ativos</span>
+  </div>
+  <div class='card'>
+    <h4>Absenteísmo (proxy)</h4>
+    <h2>{abs_str}</h2>
+    <span class='sub neu'>{abs_note}</span>
+  </div>
+  <div class='card'>
+    <h4>Treinamentos (mês)</h4>
+    <h2>{treinos_ok:,}/{treinos_total:,}</h2>
+    <span class='sub neu'>concluídos/total</span>
+  </div>
+</div>
+""".replace(",", ".")
+st.markdown(cards_html, unsafe_allow_html=True)
+
+
+# ------------------ ABAS ------------------
+tab1, tab2, tab3, tab4 = st.tabs(["Visão geral", "Turnover/Absenteísmo", "Treinamentos", "Detalhes"])
+
+# ---------- VISÃO GERAL ----------
 with tab1:
-    st.markdown("### Distribuição")
-    colA, colB = st.columns(2)
+    st.markdown('<div class="section">Distribuição</div>', unsafe_allow_html=True)
 
-    city_counts = df_f.groupby("CIDADE", dropna=False).size().reset_index(name="HEADCOUNT")
-    fig_city = px.bar(city_counts.sort_values("HEADCOUNT", ascending=False), x="CIDADE", y="HEADCOUNT")
-    colA.plotly_chart(fig_city, use_container_width=True)
+    cA, cB = st.columns(2)
 
-    func_counts = df_f.groupby("FUNCAO", dropna=False).size().reset_index(name="HEADCOUNT")
-    fig_func = px.bar(func_counts.sort_values("HEADCOUNT", ascending=True), x="HEADCOUNT", y="FUNCAO", orientation="h")
-    colB.plotly_chart(fig_func, use_container_width=True)
+    with cA:
+        if not ativos.empty and "UNIDADE" in ativos.columns:
+            by_un = ativos.groupby("UNIDADE")["COLABORADOR"].nunique().reset_index(name="ATIVOS")
+            by_un = by_un.sort_values("ATIVOS", ascending=False)
+            ch = alt.Chart(by_un).mark_bar().encode(
+                x=alt.X("UNIDADE:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=220), title="UNIDADE"),
+                y=alt.Y("ATIVOS:Q", title="ATIVOS"),
+                tooltip=["UNIDADE", "ATIVOS"],
+            ).properties(height=320)
+            st.subheader("Ativos por unidade")
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.info("Sem dados suficientes para 'Ativos por unidade'.")
 
-    st.markdown("### Ativos x Desligados por Cidade")
-    status_city = df_f.groupby(["CIDADE", "STATUS"]).size().reset_index(name="QTD")
-    fig_sc = px.bar(status_city, x="CIDADE", y="QTD", color="STATUS", barmode="stack")
-    st.plotly_chart(fig_sc, use_container_width=True)
+    with cB:
+        if not ativos.empty and "CARGO" in ativos.columns:
+            by_cg = ativos.groupby("CARGO")["COLABORADOR"].nunique().reset_index(name="ATIVOS")
+            by_cg = by_cg.sort_values("ATIVOS", ascending=False).head(15)
+            ch = alt.Chart(by_cg).mark_bar().encode(
+                x=alt.X("CARGO:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=240), title="CARGO"),
+                y=alt.Y("ATIVOS:Q", title="ATIVOS"),
+                tooltip=["CARGO", "ATIVOS"],
+            ).properties(height=320)
+            st.subheader("Top cargos (até 15)")
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.info("Sem dados suficientes para 'Top cargos'.")
 
-    st.markdown("### Base filtrada (tabela)")
-    st.dataframe(df_f, use_container_width=True, height=380)
+    if not fast_mode:
+        st.markdown('<div class="section">Movimentações do mês</div>', unsafe_allow_html=True)
 
+        mov = []
+        if not bg.empty and "COLABORADOR" in bg.columns:
+            if "DATA_ADMISSAO" in bg.columns:
+                a = bg[bg["DATA_ADMISSAO"].map(lambda d: _is_in_month(d, ym_sel))].copy()
+                if not a.empty:
+                    a["TIPO"] = "Admissão"
+                    mov.append(a[["COLABORADOR", "UNIDADE", "CARGO", "TIPO"]].copy())
+            if "DATA_DESLIGAMENTO" in bg.columns:
+                d = bg[bg["DATA_DESLIGAMENTO"].map(lambda x: _is_in_month(x, ym_sel))].copy()
+                if not d.empty:
+                    d["TIPO"] = "Desligamento"
+                    mov.append(d[["COLABORADOR", "UNIDADE", "CARGO", "TIPO"]].copy())
+        if mov:
+            movdf = pd.concat(mov, ignore_index=True)
+            st.dataframe(movdf, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem dados de admissões/desligamentos no mês (ou sem colunas de datas).")
+
+
+# ---------- TURNOVER / ABSENTEÍSMO ----------
 with tab2:
-    st.markdown("### Idade")
-    idade_counts = df_f.groupby("FAIXA_IDADE").size().reset_index(name="QTD")
-    ordem_idade = ["<18 (inconsistente)", "18–24", "25–29", "30–34", "35–39", "40+", "Sem dado"]
-    idade_counts["ORDEM"] = idade_counts["FAIXA_IDADE"].apply(lambda x: ordem_idade.index(x) if x in ordem_idade else 999)
-    idade_counts = idade_counts.sort_values("ORDEM")
-    fig_idade = px.bar(idade_counts, x="FAIXA_IDADE", y="QTD")
-    st.plotly_chart(fig_idade, use_container_width=True)
+    st.markdown('<div class="section">Turnover</div>', unsafe_allow_html=True)
 
-    st.markdown("### Tempo de casa")
-    tc_counts = df_f.groupby("FAIXA_TEMPO_CASA").size().reset_index(name="QTD")
-    ordem_tc = ["Inconsistente", "<3 meses", "3–6 meses", "6–12 meses", "1–2 anos", "2–5 anos", "5+ anos", "Sem dado"]
-    tc_counts["ORDEM"] = tc_counts["FAIXA_TEMPO_CASA"].apply(lambda x: ordem_tc.index(x) if x in ordem_tc else 999)
-    tc_counts = tc_counts.sort_values("ORDEM")
-    fig_tc = px.bar(tc_counts, x="FAIXA_TEMPO_CASA", y="QTD")
-    st.plotly_chart(fig_tc, use_container_width=True)
+    # Série por mês (se tiver BG consolidado com datas)
+    if not df_base_geral.empty and "DATA_ADMISSAO" in df_base_geral.columns:
+        base_all = df_base_geral.copy()
+        if f_emp and "EMPRESA" in base_all.columns:
+            base_all = base_all[base_all["EMPRESA"].isin([_upper(x) for x in f_emp])]
+        if f_unid and "UNIDADE" in base_all.columns:
+            base_all = base_all[base_all["UNIDADE"].isin([_upper(x) for x in f_unid])]
+        if perfil_sel != "Todos" and "TEMPO_CASA" in base_all.columns:
+            alvo = "NOVATO" if perfil_sel == "Novatos" else "VETERANO"
+            base_all = base_all[base_all["TEMPO_CASA"] == alvo]
 
-    st.markdown("### Médias")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Idade média (anos)", f"{df_f['IDADE'].dropna().mean():.1f}" if df_f["IDADE"].notna().any() else "Sem dado")
-    with col2:
-        st.metric("Tempo médio de casa (anos)", f"{df_f['TEMPO_CASA_ANOS'].dropna().mean():.2f}" if df_f["TEMPO_CASA_ANOS"].notna().any() else "Sem dado")
+        # cria coluna YM a partir de datas (quando existir)
+        def _ym_from_date(d):
+            return f"{d.year}-{d.month:02d}" if isinstance(d, date) else ""
+        base_all["_YM_ADM"] = base_all["DATA_ADMISSAO"].map(_ym_from_date) if "DATA_ADMISSAO" in base_all.columns else ""
+        base_all["_YM_DES"] = base_all["DATA_DESLIGAMENTO"].map(_ym_from_date) if "DATA_DESLIGAMENTO" in base_all.columns else ""
 
+        adm_s = base_all[base_all["_YM_ADM"] != ""].groupby("_YM_ADM")["COLABORADOR"].nunique().reset_index(name="ADM")
+        des_s = base_all[base_all["_YM_DES"] != ""].groupby("_YM_DES")["COLABORADOR"].nunique().reset_index(name="DES")
+
+        serie = adm_s.merge(des_s, left_on="_YM_ADM", right_on="_YM_DES", how="outer").fillna(0)
+        serie["YM"] = serie["_YM_ADM"].where(serie["_YM_ADM"] != "", serie["_YM_DES"])
+        serie = serie[["YM", "ADM", "DES"]].copy()
+        serie["ADM"] = serie["ADM"].astype(int)
+        serie["DES"] = serie["DES"].astype(int)
+        serie = serie.sort_values("YM")
+
+        # ativos por mês (proxy: usa ativos do mês (se existir YM em cada linha), senão usa o do filtro)
+        # para manter simples, usa o total do mês selecionado como denominador.
+        denom = max(total_colab, 1)
+        serie["TURNOVER_%"] = (((serie["ADM"] + serie["DES"]) / 2) / denom * 100).round(1)
+
+        ch = alt.Chart(serie).mark_line(point=True).encode(
+            x=alt.X("YM:N", title="MÊS"),
+            y=alt.Y("TURNOVER_%:Q", title="Turnover (%)"),
+            tooltip=["YM", "ADM", "DES", alt.Tooltip("TURNOVER_%:Q", format=".1f")]
+        ).properties(height=300)
+        st.altair_chart(ch, use_container_width=True)
+    else:
+        st.info("Sem base com DATA_ADMISSAO/DATA_DESLIGAMENTO suficiente para série histórica de Turnover.")
+
+    st.markdown('<div class="section">Absenteísmo</div>', unsafe_allow_html=True)
+
+    if not pr.empty and "DATA" in pr.columns and "STATUS_PRESENCA" in pr.columns:
+        tmp = pr.copy()
+        tmp["DIA"] = pd.to_datetime(tmp["DATA"], errors="coerce")
+        tmp = tmp[tmp["DIA"].notna()]
+        tmp["FALTA"] = tmp["STATUS_PRESENCA"].astype(str).map(_upper).str.contains(r"FALTA|AUSEN|AUSÊN|ATEST", regex=True, na=False).astype(int)
+
+        day = tmp.groupby(tmp["DIA"].dt.date)["FALTA"].agg(["sum", "count"]).reset_index()
+        day = day.rename(columns={"sum": "FALTAS", "count": "REGISTROS", "DIA": "DATA"})
+        day["ABS_%"] = (day["FALTAS"] / day["REGISTROS"] * 100).round(1)
+
+        ch = alt.Chart(day).mark_bar().encode(
+            x=alt.X("DATA:N", title="DATA", axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("ABS_%:Q", title="Absenteísmo (%)"),
+            tooltip=["DATA", "FALTAS", "REGISTROS", alt.Tooltip("ABS_%:Q", format=".1f")]
+        ).properties(height=280)
+        st.altair_chart(ch, use_container_width=True)
+
+        if not fast_mode:
+            st.dataframe(day.sort_values("DATA", ascending=False), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sem BASE PRESENÇA suficiente para calcular absenteísmo por dia.")
+
+
+# ---------- TREINAMENTOS ----------
 with tab3:
-    st.markdown("### Absenteísmo por cidade")
-    abs_city = df_f.groupby("CIDADE")["FALTAS_TOTAL"].sum().reset_index()
-    abs_city = abs_city.sort_values("FALTAS_TOTAL", ascending=False)
-    fig_abs_city = px.bar(abs_city, x="CIDADE", y="FALTAS_TOTAL")
-    st.plotly_chart(fig_abs_city, use_container_width=True)
+    st.markdown('<div class="section">Treinamentos do mês</div>', unsafe_allow_html=True)
 
-    st.markdown("### Absenteísmo por gerente")
-    abs_ger = df_f.groupby("GERENTE_RESPONSAVEL")["FALTAS_TOTAL"].sum().reset_index().sort_values("FALTAS_TOTAL", ascending=False)
-    fig_abs_ger = px.bar(abs_ger, x="GERENTE_RESPONSAVEL", y="FALTAS_TOTAL")
-    st.plotly_chart(fig_abs_ger, use_container_width=True)
-
-    st.markdown("### Top faltas (colaborador)")
-    top_abs = df_f.groupby("NOME_NORM")["FALTAS_TOTAL"].sum().reset_index().sort_values("FALTAS_TOTAL", ascending=False)
-    top_abs = top_abs[top_abs["FALTAS_TOTAL"] > 0].head(15)
-    if len(top_abs) == 0:
-        st.info("Sem faltas no recorte atual.")
+    if tr.empty:
+        st.info("Sem dados de TREINAMENTOS no mês/filtros.")
     else:
-        fig_top = px.bar(top_abs, x="NOME_NORM", y="FALTAS_TOTAL")
-        st.plotly_chart(fig_top, use_container_width=True)
+        # por treinamento
+        by_t = tr.groupby("TREINAMENTO")["COLABORADOR"].nunique().reset_index(name="PESSOAS")
+        by_t = by_t.sort_values("PESSOAS", ascending=False).head(15)
 
+        c1, c2 = st.columns(2)
+
+        with c1:
+            ch = alt.Chart(by_t).mark_bar().encode(
+                x=alt.X("TREINAMENTO:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=220), title="TREINAMENTO"),
+                y=alt.Y("PESSOAS:Q", title="PESSOAS"),
+                tooltip=["TREINAMENTO", "PESSOAS"]
+            ).properties(height=320)
+            st.subheader("Top treinamentos (até 15)")
+            st.altair_chart(ch, use_container_width=True)
+
+        with c2:
+            # por unidade
+            if "UNIDADE" in tr.columns:
+                by_u = tr.groupby("UNIDADE")["COLABORADOR"].nunique().reset_index(name="PESSOAS")
+                by_u = by_u.sort_values("PESSOAS", ascending=False)
+                ch = alt.Chart(by_u).mark_bar().encode(
+                    x=alt.X("UNIDADE:N", sort='-y', axis=alt.Axis(labelAngle=0, labelLimit=220), title="UNIDADE"),
+                    y=alt.Y("PESSOAS:Q", title="PESSOAS"),
+                    tooltip=["UNIDADE", "PESSOAS"]
+                ).properties(height=320)
+                st.subheader("Participação por unidade")
+                st.altair_chart(ch, use_container_width=True)
+            else:
+                st.info("Sem UNIDADE em TREINAMENTOS.")
+
+        if not fast_mode:
+            st.markdown('<div class="section">Detalhamento (treinamentos)</div>', unsafe_allow_html=True)
+            cols_show = [c for c in ["DATA","UNIDADE","COLABORADOR","CARGO","TREINAMENTO","STATUS"] if c in tr.columns]
+            st.dataframe(tr[cols_show].sort_values(cols_show[0] if cols_show else tr.columns[0]), use_container_width=True, hide_index=True)
+
+
+# ---------- DETALHES (base geral/presença/abs) ----------
 with tab4:
-    st.markdown("### Desligamentos no mês (detalhe)")
-    if "DT_DEMISSAO" in df_f.columns:
-        dem = pd.to_datetime(df_f["DT_DEMISSAO"], errors="coerce", dayfirst=True)
-        deslig_mes = df_f[(dem.dt.date >= metrics["periodo_inicio"]) & (dem.dt.date <= metrics["periodo_fim"])].copy()
-        deslig_mes["DT_DEMISSAO"] = dem
+    st.markdown('<div class="section">Base Geral (recorte)</div>', unsafe_allow_html=True)
+    if bg.empty:
+        st.info("Sem dados em BASE GERAL no mês/filtros.")
     else:
-        deslig_mes = pd.DataFrame()
+        cols = [c for c in ["EMPRESA","UNIDADE","COLABORADOR","CARGO","SITUACAO","DATA_ADMISSAO","DATA_DESLIGAMENTO","TEMPO_CASA","YM"] if c in bg.columns]
+        st.dataframe(bg[cols].sort_values(["UNIDADE","COLABORADOR"]) if "UNIDADE" in bg.columns else bg[cols], use_container_width=True, hide_index=True)
 
-    if deslig_mes.empty:
-        st.info("Sem desligamentos no mês no recorte atual.")
-    else:
-        cols_show = [c for c in ["CIDADE", "GERENTE_RESPONSAVEL", "FUNCAO", "STATUS", "DT_DEMISSAO", "MOTIVO_DEMISSAO", "NOME_NORM"] if c in deslig_mes.columns]
-        st.dataframe(deslig_mes[cols_show].sort_values("DT_DEMISSAO"), use_container_width=True, height=320)
+    if not fast_mode:
+        st.markdown('<div class="section">Presença (recorte)</div>', unsafe_allow_html=True)
+        if pr.empty:
+            st.info("Sem dados em BASE PRESENÇA no mês/filtros.")
+        else:
+            cols = [c for c in ["DATA","UNIDADE","COLABORADOR","STATUS_PRESENCA","YM"] if c in pr.columns]
+            st.dataframe(pr[cols].sort_values(["DATA","UNIDADE","COLABORADOR"]) if "DATA" in pr.columns else pr[cols], use_container_width=True, hide_index=True)
 
-        if "MOTIVO_DEMISSAO" in deslig_mes.columns:
-            m = deslig_mes.groupby("MOTIVO_DEMISSAO").size().reset_index(name="QTD").sort_values("QTD", ascending=False)
-            fig_m = px.bar(m, x="MOTIVO_DEMISSAO", y="QTD")
-            st.plotly_chart(fig_m, use_container_width=True)
-
-    st.markdown("### Admissões no mês (detalhe)")
-    if "DT_ADMISSAO" in df_f.columns:
-        adm = pd.to_datetime(df_f["DT_ADMISSAO"], errors="coerce", dayfirst=True)
-        adm_mes = df_f[(adm.dt.date >= metrics["periodo_inicio"]) & (adm.dt.date <= metrics["periodo_fim"])].copy()
-        adm_mes["DT_ADMISSAO"] = adm
-    else:
-        adm_mes = pd.DataFrame()
-
-    if adm_mes.empty:
-        st.info("Sem admissões no mês no recorte atual.")
-    else:
-        cols_show = [c for c in ["CIDADE", "GERENTE_RESPONSAVEL", "FUNCAO", "DT_ADMISSAO", "NOME_NORM"] if c in adm_mes.columns]
-        st.dataframe(adm_mes[cols_show].sort_values("DT_ADMISSAO"), use_container_width=True, height=320)
-
-with tab5:
-    st.markdown("### Participação no treinamento")
-    tr_sum = df_f.groupby("CIDADE")["PRESENCA_OK"].mean().reset_index()
-    tr_sum["PCT"] = tr_sum["PRESENCA_OK"] * 100
-    fig_tr_city = px.bar(tr_sum.sort_values("PCT", ascending=False), x="CIDADE", y="PCT")
-    st.plotly_chart(fig_tr_city, use_container_width=True)
-
-    tr_ger = df_f.groupby("GERENTE_RESPONSAVEL")["PRESENCA_OK"].mean().reset_index()
-    tr_ger["PCT"] = tr_ger["PRESENCA_OK"] * 100
-    fig_tr_ger = px.bar(tr_ger.sort_values("PCT", ascending=False), x="GERENTE_RESPONSAVEL", y="PCT")
-    st.plotly_chart(fig_tr_ger, use_container_width=True)
-
-    st.markdown("### Lista de não participantes")
-    nao = df_f[df_f["PRESENCA_OK"] == False].copy()
-    if nao.empty:
-        st.info("Sem não participantes no recorte atual.")
-    else:
-        cols_show = [c for c in ["CIDADE", "GERENTE_RESPONSAVEL", "FUNCAO", "STATUS", "NOME_NORM"] if c in nao.columns]
+        st.markdown('<div class="section">Absenteísmo/Turnover (recorte)</div>', unsafe_allow_html=True)
+        if ab.empty:
+            st.info("Sem dados em ABSENTEISMO E TURNOVER no mês/filtros.")
+        else:
+            cols = [c for c in ["DATA","EMPRESA","UNIDADE","TIPO","QTD","YM"] if c in ab.columns]
+            st.dataframe(ab[cols].sort_values(["DATA","TIPO"]) if "DATA" in ab.columns else ab[cols], use_container_width=True, hide_index=True)
