@@ -16,14 +16,14 @@ from google.oauth2.service_account import Credentials
 # =========================
 st.set_page_config(page_title="Painel RH - VELOX", layout="wide")
 
-# ✅ IMPORTANTE: aqui precisa ser URL COMPLETA (não apenas o ID)
+# ✅ use URL completa do índice (ou pode ser só ID, o código extrai)
 INDEX_SHEET_URL = "https://docs.google.com/spreadsheets/d/1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo/edit?gid=0#gid=0"
 
-# ✅ Nomes das abas (conforme seu padrão real)
+# ✅ Nomes das abas (conforme seu padrão)
 TAB_BASE_GERAL = "BASE GERAL"
 TAB_BASE_PRESENCA = "BASE PRESENÇA"
 TAB_TREINAMENTOS = "TREINAMENTOS"
-TAB_ABS_TURNOVER = "ABSENTEISMO E TURNOVER"
+TAB_ABS_TURNOVER = "ABSENTEISMO E TURNOVER"  # (não usado ainda, mas mantido)
 
 # ✅ Mapeamento gerencial informado por você
 GERENTE_POR_CIDADE = {
@@ -40,13 +40,6 @@ GERENTE_POR_CIDADE = {
 # =========================
 # HELPERS
 # =========================
-def extract_sheet_id(url: str) -> str:
-    if not isinstance(url, str):
-        return ""
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-    return m.group(1) if m else ""
-
-
 def norm_text(x):
     if pd.isna(x):
         return ""
@@ -87,6 +80,26 @@ def month_start_end(mes_ref: str):
     return start, end
 
 
+def extract_sheet_id(value: str) -> str:
+    """
+    ✅ Aceita:
+    - ID puro (ex.: 1C-tDIPxrLRVC-qjgA_Z8nn7K5M3nmxaO9jEYWfhBX7s)
+    - URL completa (ex.: https://docs.google.com/spreadsheets/d/<ID>/edit?gid=...)
+    - URL com espaços/invisíveis
+    """
+    if not isinstance(value, str):
+        return ""
+    s = value.strip()
+
+    # ID puro
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", s):
+        return s
+
+    # URL
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    return m.group(1) if m else ""
+
+
 def kpi_card(col, title, value, subtitle=None):
     with col:
         st.markdown(
@@ -111,13 +124,28 @@ def get_gspread_client():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def read_worksheet_as_df(sheet_url: str, tab_name: str) -> pd.DataFrame:
+def read_worksheet_as_df(sheet_id_or_url: str, tab_name: str) -> pd.DataFrame:
+    """
+    ✅ Ajuste principal:
+    - NÃO usa open_by_url
+    - SEMPRE extrai ID e usa open_by_key (mais robusto)
+    - Funciona mesmo se o índice estiver com link/hyperlink
+    """
     gc = get_gspread_client()
-    sh = gc.open_by_url(sheet_url)
+
+    raw = norm_text(sheet_id_or_url)
+    sheet_id = extract_sheet_id(raw)
+
+    if not sheet_id:
+        raise ValueError(f"Não foi possível extrair o ID da planilha a partir de: {raw}")
+
+    sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
+
     values = ws.get_all_values()
     if not values or len(values) < 2:
         return pd.DataFrame()
+
     header = values[0]
     data = values[1:]
     df = pd.DataFrame(data, columns=header)
@@ -126,9 +154,15 @@ def read_worksheet_as_df(sheet_url: str, tab_name: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def read_index_df(index_url: str) -> pd.DataFrame:
-    # ✅ Sua aba do índice é Página1 (conforme print)
-    df = read_worksheet_as_df(index_url, "Página1")
+def read_index_df(index_sheet_url: str) -> pd.DataFrame:
+    """
+    Esperado no índice:
+    - URL (ou URL_BASE)
+    - MÊS (ou MES_REF)
+    - ATIVO
+    Aba: Página1 (conforme seus prints)
+    """
+    df = read_worksheet_as_df(index_sheet_url, "Página1")
 
     cols = {c.upper(): c for c in df.columns}
     url_col = cols.get("URL_BASE") or cols.get("URL")
@@ -142,7 +176,6 @@ def read_index_df(index_url: str) -> pd.DataFrame:
     out.columns = ["URL_BASE", "MES_REF", "ATIVO"]
     out["MES_REF"] = out["MES_REF"].apply(norm_text)
     out["ATIVO"] = out["ATIVO"].apply(lambda x: norm_text(x).upper())
-    out["SHEET_ID"] = out["URL_BASE"].apply(extract_sheet_id)
     return out
 
 
@@ -192,7 +225,6 @@ def build_base_geral(df_bg: pd.DataFrame) -> pd.DataFrame:
 
     if "FUNCAO" in df.columns:
         df["FUNCAO"] = df["FUNCAO"].apply(lambda x: norm_text(x).upper())
-        df["FUNCAO"] = df["FUNCAO"].str.replace("VISTORIADORA", "VISTORIADOR", regex=False)
 
     if "STATUS" in df.columns:
         df["STATUS"] = df["STATUS"].apply(lambda x: norm_text(x).upper())
@@ -383,7 +415,6 @@ def quality_alerts(df_base: pd.DataFrame, df_tr: pd.DataFrame):
         bad_age = df_base[df_base["FAIXA_IDADE"] == "<18 (inconsistente)"]
         if len(bad_age) > 0:
             alerts.append(f"Idade inconsistente: {len(bad_age)} registro(s) com idade < 18.")
-
     if not df_tr.empty:
         base_names = set(df_base["NOME_NORM"].tolist())
         tr_names = set(df_tr["NOME_NORM"].tolist())
@@ -398,7 +429,7 @@ def quality_alerts(df_base: pd.DataFrame, df_tr: pd.DataFrame):
 # =========================
 st.title("Painel de RH - VELOX Vistorias")
 
-# ✅ Diagnóstico: se quebrar, mostra o erro na tela (evita ficar 'em desenvolvimento' no Cloud)
+# Índice
 try:
     idx = read_index_df(INDEX_SHEET_URL)
 except Exception as e:
@@ -406,7 +437,7 @@ except Exception as e:
     st.stop()
 
 if idx.empty or not set(["URL_BASE", "MES_REF", "ATIVO"]).issubset(set(idx.columns)):
-    st.error("A aba do índice não está no formato esperado. Verifique colunas URL (ou URL_BASE), MÊS (ou MES_REF) e ATIVO.")
+    st.error("A aba do índice não está no formato esperado. Precisa de colunas: URL (ou URL_BASE), MÊS (ou MES_REF), ATIVO.")
     st.dataframe(idx)
     st.stop()
 
@@ -418,14 +449,18 @@ if ativos.empty:
 
 with st.sidebar:
     st.subheader("Controle")
-    st.caption("O painel lê a planilha ÍNDICE_MESES e puxa a base do mês selecionado.")
+    st.caption("O painel lê o índice e puxa a base do mês selecionado.")
     st.divider()
 
 mes_opts = ativos["MES_REF"].tolist()
 mes_sel = st.sidebar.selectbox("Mês de referência", mes_opts, index=len(mes_opts) - 1)
 
 row = ativos[ativos["MES_REF"] == mes_sel].iloc[0]
-base_url = row["URL_BASE"]
+base_url = norm_text(row["URL_BASE"])
+
+# ✅ Debug (ajuda a identificar se o índice está trazendo texto/hyperlink estranho)
+st.sidebar.caption(f"Valor vindo do índice: {base_url}")
+st.sidebar.caption(f"ID extraído: {extract_sheet_id(base_url)}")
 
 with st.spinner("Carregando base do mês..."):
     df_bg_raw = read_worksheet_as_df(base_url, TAB_BASE_GERAL)
@@ -488,7 +523,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Absenteísmo",
     "Turnover",
     "Treinamentos",
-    "Gerencial (Jorge x Moisés)"
+    "Gerencial (Jorge x Moisés)",
 ])
 
 with tab1:
@@ -496,17 +531,14 @@ with tab1:
     colA, colB = st.columns(2)
 
     city_counts = df_f.groupby("CIDADE", dropna=False).size().reset_index(name="HEADCOUNT")
-    fig_city = px.bar(city_counts.sort_values("HEADCOUNT", ascending=False), x="CIDADE", y="HEADCOUNT")
-    colA.plotly_chart(fig_city, use_container_width=True)
+    colA.plotly_chart(px.bar(city_counts.sort_values("HEADCOUNT", ascending=False), x="CIDADE", y="HEADCOUNT"), use_container_width=True)
 
     func_counts = df_f.groupby("FUNCAO", dropna=False).size().reset_index(name="HEADCOUNT")
-    fig_func = px.bar(func_counts.sort_values("HEADCOUNT", ascending=True), x="HEADCOUNT", y="FUNCAO", orientation="h")
-    colB.plotly_chart(fig_func, use_container_width=True)
+    colB.plotly_chart(px.bar(func_counts.sort_values("HEADCOUNT", ascending=True), x="HEADCOUNT", y="FUNCAO", orientation="h"), use_container_width=True)
 
     st.markdown("### Ativos x Desligados por Cidade")
     status_city = df_f.groupby(["CIDADE", "STATUS"]).size().reset_index(name="QTD")
-    fig_sc = px.bar(status_city, x="CIDADE", y="QTD", color="STATUS", barmode="stack")
-    st.plotly_chart(fig_sc, use_container_width=True)
+    st.plotly_chart(px.bar(status_city, x="CIDADE", y="QTD", color="STATUS", barmode="stack"), use_container_width=True)
 
     st.markdown("### Base filtrada (tabela)")
     st.dataframe(df_f, use_container_width=True, height=380)
@@ -517,52 +549,44 @@ with tab2:
     ordem_idade = ["<18 (inconsistente)", "18–24", "25–29", "30–34", "35–39", "40+", "Sem dado"]
     idade_counts["ORDEM"] = idade_counts["FAIXA_IDADE"].apply(lambda x: ordem_idade.index(x) if x in ordem_idade else 999)
     idade_counts = idade_counts.sort_values("ORDEM")
-    fig_idade = px.bar(idade_counts, x="FAIXA_IDADE", y="QTD")
-    st.plotly_chart(fig_idade, use_container_width=True)
+    st.plotly_chart(px.bar(idade_counts, x="FAIXA_IDADE", y="QTD"), use_container_width=True)
 
     st.markdown("### Tempo de casa")
     tc_counts = df_f.groupby("FAIXA_TEMPO_CASA").size().reset_index(name="QTD")
     ordem_tc = ["Inconsistente", "<3 meses", "3–6 meses", "6–12 meses", "1–2 anos", "2–5 anos", "5+ anos", "Sem dado"]
     tc_counts["ORDEM"] = tc_counts["FAIXA_TEMPO_CASA"].apply(lambda x: ordem_tc.index(x) if x in ordem_tc else 999)
     tc_counts = tc_counts.sort_values("ORDEM")
-    fig_tc = px.bar(tc_counts, x="FAIXA_TEMPO_CASA", y="QTD")
-    st.plotly_chart(fig_tc, use_container_width=True)
+    st.plotly_chart(px.bar(tc_counts, x="FAIXA_TEMPO_CASA", y="QTD"), use_container_width=True)
 
-    st.markdown("### Médias")
-    col1, col2 = st.columns(2)
-    with col1:
+    cA, cB = st.columns(2)
+    with cA:
         st.metric("Idade média (anos)", f"{df_f['IDADE'].dropna().mean():.1f}" if df_f["IDADE"].notna().any() else "Sem dado")
-    with col2:
+    with cB:
         st.metric("Tempo médio de casa (anos)", f"{df_f['TEMPO_CASA_ANOS'].dropna().mean():.2f}" if df_f["TEMPO_CASA_ANOS"].notna().any() else "Sem dado")
 
 with tab3:
     st.markdown("### Absenteísmo por cidade")
-    abs_city = df_f.groupby("CIDADE")["FALTAS_TOTAL"].sum().reset_index()
-    abs_city = abs_city.sort_values("FALTAS_TOTAL", ascending=False)
-    fig_abs_city = px.bar(abs_city, x="CIDADE", y="FALTAS_TOTAL")
-    st.plotly_chart(fig_abs_city, use_container_width=True)
+    abs_city = df_f.groupby("CIDADE")["FALTAS_TOTAL"].sum().reset_index().sort_values("FALTAS_TOTAL", ascending=False)
+    st.plotly_chart(px.bar(abs_city, x="CIDADE", y="FALTAS_TOTAL"), use_container_width=True)
 
     st.markdown("### Absenteísmo por gerente")
     abs_ger = df_f.groupby("GERENTE_RESPONSAVEL")["FALTAS_TOTAL"].sum().reset_index().sort_values("FALTAS_TOTAL", ascending=False)
-    fig_abs_ger = px.bar(abs_ger, x="GERENTE_RESPONSAVEL", y="FALTAS_TOTAL")
-    st.plotly_chart(fig_abs_ger, use_container_width=True)
+    st.plotly_chart(px.bar(abs_ger, x="GERENTE_RESPONSAVEL", y="FALTAS_TOTAL"), use_container_width=True)
 
     st.markdown("### Top faltas (colaborador)")
     top_abs = df_f.groupby("NOME_NORM")["FALTAS_TOTAL"].sum().reset_index().sort_values("FALTAS_TOTAL", ascending=False)
     top_abs = top_abs[top_abs["FALTAS_TOTAL"] > 0].head(15)
-    if len(top_abs) == 0:
+    if top_abs.empty:
         st.info("Sem faltas no recorte atual.")
     else:
-        fig_top = px.bar(top_abs, x="NOME_NORM", y="FALTAS_TOTAL")
-        st.plotly_chart(fig_top, use_container_width=True)
+        st.plotly_chart(px.bar(top_abs, x="NOME_NORM", y="FALTAS_TOTAL"), use_container_width=True)
 
 with tab4:
     st.markdown("### Desligamentos no mês (detalhe)")
-    deslig = df_f.copy()
-    if "DT_DEMISSAO" in deslig.columns:
-        deslig_mes = deslig[
-            (deslig["DT_DEMISSAO"].dt.date >= metrics["periodo_inicio"]) &
-            (deslig["DT_DEMISSAO"].dt.date <= metrics["periodo_fim"])
+    if "DT_DEMISSAO" in df_f.columns:
+        deslig_mes = df_f[
+            (df_f["DT_DEMISSAO"].dt.date >= metrics["periodo_inicio"]) &
+            (df_f["DT_DEMISSAO"].dt.date <= metrics["periodo_fim"])
         ].copy()
     else:
         deslig_mes = pd.DataFrame()
@@ -575,8 +599,7 @@ with tab4:
 
         if "MOTIVO_DEMISSAO" in deslig_mes.columns:
             m = deslig_mes.groupby("MOTIVO_DEMISSAO").size().reset_index(name="QTD").sort_values("QTD", ascending=False)
-            fig_m = px.bar(m, x="MOTIVO_DEMISSAO", y="QTD")
-            st.plotly_chart(fig_m, use_container_width=True)
+            st.plotly_chart(px.bar(m, x="MOTIVO_DEMISSAO", y="QTD"), use_container_width=True)
 
     st.markdown("### Entradas no mês (detalhe)")
     if "DT_ADMISSAO" in df_f.columns:
@@ -597,13 +620,11 @@ with tab5:
     st.markdown("### Participação no treinamento")
     tr_sum = df_f.groupby("CIDADE")["PRESENCA_OK"].mean().reset_index()
     tr_sum["PCT"] = tr_sum["PRESENCA_OK"] * 100
-    fig_tr_city = px.bar(tr_sum.sort_values("PCT", ascending=False), x="CIDADE", y="PCT")
-    st.plotly_chart(fig_tr_city, use_container_width=True)
+    st.plotly_chart(px.bar(tr_sum.sort_values("PCT", ascending=False), x="CIDADE", y="PCT"), use_container_width=True)
 
     tr_ger = df_f.groupby("GERENTE_RESPONSAVEL")["PRESENCA_OK"].mean().reset_index()
     tr_ger["PCT"] = tr_ger["PRESENCA_OK"] * 100
-    fig_tr_ger = px.bar(tr_ger.sort_values("PCT", ascending=False), x="GERENTE_RESPONSAVEL", y="PCT")
-    st.plotly_chart(fig_tr_ger, use_container_width=True)
+    st.plotly_chart(px.bar(tr_ger.sort_values("PCT", ascending=False), x="GERENTE_RESPONSAVEL", y="PCT"), use_container_width=True)
 
     st.markdown("### Lista de não participantes")
     nao = df_f[df_f["PRESENCA_OK"] == False].copy()
@@ -633,10 +654,5 @@ with tab6:
 
     st.dataframe(agg.sort_values("HEADCOUNT", ascending=False), use_container_width=True, height=280)
 
-    fig_abs = px.bar(agg.sort_values("ABS_PCT_APROX", ascending=False), x="GERENTE_RESPONSAVEL", y="ABS_PCT_APROX")
-    st.plotly_chart(fig_abs, use_container_width=True)
-
-    fig_tc = px.bar(agg.sort_values("TEMPO_CASA_MEDIA", ascending=False), x="GERENTE_RESPONSAVEL", y="TEMPO_CASA_MEDIA")
-    st.plotly_chart(fig_tc, use_container_width=True)
-
-
+    st.plotly_chart(px.bar(agg.sort_values("ABS_PCT_APROX", ascending=False), x="GERENTE_RESPONSAVEL", y="ABS_PCT_APROX"), use_container_width=True)
+    st.plotly_chart(px.bar(agg.sort_values("TEMPO_CASA_MEDIA", ascending=False), x="GERENTE_RESPONSAVEL", y="TEMPO_CASA_MEDIA"), use_container_width=True)
