@@ -16,16 +16,14 @@ from google.oauth2.service_account import Credentials
 # =========================
 st.set_page_config(page_title="Painel RH - VELOX", layout="wide")
 
-# ✅ use URL completa do índice (ou pode ser só ID, o código extrai)
 INDEX_SHEET_URL = "https://docs.google.com/spreadsheets/d/1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo/edit?gid=0#gid=0"
 
-# ✅ Nomes das abas (conforme seu padrão)
+# Abas (conforme suas bases)
 TAB_BASE_GERAL = "BASE GERAL"
 TAB_BASE_PRESENCA = "BASE PRESENÇA"
 TAB_TREINAMENTOS = "TREINAMENTOS"
-TAB_ABS_TURNOVER = "ABSENTEISMO E TURNOVER"  # (não usado ainda, mas mantido)
+TAB_ABS_TURNOVER = "ABSENTEISMO E TURNOVER"  # mantido
 
-# ✅ Mapeamento gerencial informado por você
 GERENTE_POR_CIDADE = {
     "IMPERATRIZ": "Jorge Alexandre Bezerra da Costa",
     "ESTREITO": "Jorge Alexandre Bezerra da Costa",
@@ -63,10 +61,13 @@ def norm_city(x):
 
 
 def parse_date_safe(x):
-    if pd.isna(x) or str(x).strip() == "":
+    if x is None:
+        return pd.NaT
+    sx = str(x).strip()
+    if sx == "" or sx.lower() in ["nan", "none", "-"]:
         return pd.NaT
     try:
-        return pd.to_datetime(x, dayfirst=True, errors="coerce")
+        return pd.to_datetime(sx, dayfirst=True, errors="coerce")
     except Exception:
         return pd.NaT
 
@@ -81,23 +82,46 @@ def month_start_end(mes_ref: str):
 
 
 def extract_sheet_id(value: str) -> str:
-    """
-    ✅ Aceita:
-    - ID puro (ex.: 1C-tDIPxrLRVC-qjgA_Z8nn7K5M3nmxaO9jEYWfhBX7s)
-    - URL completa (ex.: https://docs.google.com/spreadsheets/d/<ID>/edit?gid=...)
-    - URL com espaços/invisíveis
-    """
     if not isinstance(value, str):
         return ""
     s = value.strip()
 
-    # ID puro
     if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", s):
         return s
 
-    # URL
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
     return m.group(1) if m else ""
+
+
+def make_unique_columns(cols):
+    """
+    ✅ Garante nomes únicos, evita colunas vazias e duplicadas
+    """
+    out = []
+    seen = {}
+    for c in cols:
+        c = norm_text(c)
+        if c == "":
+            c = "COL"
+        key = c
+        if key in seen:
+            seen[key] += 1
+            key = f"{c}_{seen[c]}"
+        else:
+            seen[key] = 0
+        out.append(key)
+    return out
+
+
+def first_series(df: pd.DataFrame, colname: str) -> pd.Series:
+    """
+    ✅ Se a coluna vier duplicada, df[colname] vira DataFrame.
+    Aqui forçamos pegar a primeira coluna.
+    """
+    obj = df[colname]
+    if isinstance(obj, pd.DataFrame):
+        return obj.iloc[:, 0]
+    return obj
 
 
 def kpi_card(col, title, value, subtitle=None):
@@ -125,12 +149,6 @@ def get_gspread_client():
 
 @st.cache_data(ttl=600, show_spinner=False)
 def read_worksheet_as_df(sheet_id_or_url: str, tab_name: str) -> pd.DataFrame:
-    """
-    ✅ Ajuste principal:
-    - NÃO usa open_by_url
-    - SEMPRE extrai ID e usa open_by_key (mais robusto)
-    - Funciona mesmo se o índice estiver com link/hyperlink
-    """
     gc = get_gspread_client()
 
     raw = norm_text(sheet_id_or_url)
@@ -149,19 +167,17 @@ def read_worksheet_as_df(sheet_id_or_url: str, tab_name: str) -> pd.DataFrame:
     header = values[0]
     data = values[1:]
     df = pd.DataFrame(data, columns=header)
-    df.columns = [norm_text(c) for c in df.columns]
+
+    # ✅ normaliza cabeçalhos e evita duplicados
+    df.columns = make_unique_columns(df.columns)
+
+    # remove linhas completamente vazias
+    df = df.replace("", np.nan).dropna(how="all").fillna("")
     return df
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def read_index_df(index_sheet_url: str) -> pd.DataFrame:
-    """
-    Esperado no índice:
-    - URL (ou URL_BASE)
-    - MÊS (ou MES_REF)
-    - ATIVO
-    Aba: Página1 (conforme seus prints)
-    """
     df = read_worksheet_as_df(index_sheet_url, "Página1")
 
     cols = {c.upper(): c for c in df.columns}
@@ -214,28 +230,32 @@ def build_base_geral(df_bg: pd.DataFrame) -> pd.DataFrame:
     df = df_bg.rename(columns=colmap).copy()
 
     if "NOME" in df.columns:
-        df["NOME_NORM"] = df["NOME"].apply(norm_name)
+        df["NOME_NORM"] = first_series(df, "NOME").apply(norm_name)
     else:
         df["NOME_NORM"] = ""
 
     if "CIDADE" in df.columns:
-        df["CIDADE"] = df["CIDADE"].apply(norm_city)
+        df["CIDADE"] = first_series(df, "CIDADE").apply(norm_city)
     else:
         df["CIDADE"] = ""
 
     if "FUNCAO" in df.columns:
-        df["FUNCAO"] = df["FUNCAO"].apply(lambda x: norm_text(x).upper())
+        df["FUNCAO"] = first_series(df, "FUNCAO").apply(lambda x: norm_text(x).upper())
+    else:
+        df["FUNCAO"] = ""
 
     if "STATUS" in df.columns:
-        df["STATUS"] = df["STATUS"].apply(lambda x: norm_text(x).upper())
+        df["STATUS"] = first_series(df, "STATUS").apply(lambda x: norm_text(x).upper())
     else:
         df["STATUS"] = "ATIVO"
 
     df["GERENTE_RESPONSAVEL"] = df["CIDADE"].map(GERENTE_POR_CIDADE).fillna("Não mapeado")
 
+    # ✅ Datas (robusto contra colunas duplicadas)
     for col in ["DT_ADMISSAO", "DT_DEMISSAO", "DT_NASCIMENTO"]:
         if col in df.columns:
-            df[col] = df[col].apply(parse_date_safe)
+            s = first_series(df, col)
+            df[col] = s.apply(parse_date_safe)
 
     return df
 
@@ -253,7 +273,7 @@ def build_presenca(df_pres: pd.DataFrame) -> pd.DataFrame:
         name_col = df_pres.columns[0]
 
     df = df_pres.copy()
-    df["NOME_NORM"] = df[name_col].apply(norm_name)
+    df["NOME_NORM"] = first_series(df, name_col).apply(norm_name)
 
     day_cols = []
     for c in df.columns:
@@ -270,12 +290,12 @@ def build_presenca(df_pres: pd.DataFrame) -> pd.DataFrame:
             break
 
     if total_col:
-        df["FALTAS_TOTAL"] = ensure_numeric_series(df[total_col])
+        df["FALTAS_TOTAL"] = ensure_numeric_series(first_series(df, total_col))
     else:
         if day_cols:
             faltas = np.zeros(len(df))
             for c in day_cols:
-                faltas += ensure_numeric_series(df[c]).to_numpy()
+                faltas += ensure_numeric_series(first_series(df, c)).to_numpy()
             df["FALTAS_TOTAL"] = faltas
         else:
             df["FALTAS_TOTAL"] = 0
@@ -300,9 +320,10 @@ def build_treinamentos(df_tr: pd.DataFrame) -> pd.DataFrame:
         name_col = df_tr.columns[0]
 
     df = df_tr.copy()
-    df["NOME_NORM"] = df[name_col].apply(norm_name)
+    df["NOME_NORM"] = first_series(df, name_col).apply(norm_name)
+
     if pres_col:
-        df["PRESENCA"] = df[pres_col].apply(lambda x: norm_text(x).upper())
+        df["PRESENCA"] = first_series(df, pres_col).apply(lambda x: norm_text(x).upper())
     else:
         df["PRESENCA"] = ""
 
@@ -429,15 +450,10 @@ def quality_alerts(df_base: pd.DataFrame, df_tr: pd.DataFrame):
 # =========================
 st.title("Painel de RH - VELOX Vistorias")
 
-# Índice
-try:
-    idx = read_index_df(INDEX_SHEET_URL)
-except Exception as e:
-    st.error(f"Erro ao carregar a planilha índice: {e}")
-    st.stop()
+idx = read_index_df(INDEX_SHEET_URL)
 
 if idx.empty or not set(["URL_BASE", "MES_REF", "ATIVO"]).issubset(set(idx.columns)):
-    st.error("A aba do índice não está no formato esperado. Precisa de colunas: URL (ou URL_BASE), MÊS (ou MES_REF), ATIVO.")
+    st.error("A aba do índice precisa de colunas: URL (ou URL_BASE), MÊS (ou MES_REF), ATIVO.")
     st.dataframe(idx)
     st.stop()
 
@@ -458,9 +474,10 @@ mes_sel = st.sidebar.selectbox("Mês de referência", mes_opts, index=len(mes_op
 row = ativos[ativos["MES_REF"] == mes_sel].iloc[0]
 base_url = norm_text(row["URL_BASE"])
 
-# ✅ Debug (ajuda a identificar se o índice está trazendo texto/hyperlink estranho)
-st.sidebar.caption(f"Valor vindo do índice: {base_url}")
-st.sidebar.caption(f"ID extraído: {extract_sheet_id(base_url)}")
+st.sidebar.caption("Valor vindo do índice:")
+st.sidebar.write(base_url)
+st.sidebar.caption("ID extraído:")
+st.sidebar.write(extract_sheet_id(base_url))
 
 with st.spinner("Carregando base do mês..."):
     df_bg_raw = read_worksheet_as_df(base_url, TAB_BASE_GERAL)
@@ -653,6 +670,5 @@ with tab6:
     )
 
     st.dataframe(agg.sort_values("HEADCOUNT", ascending=False), use_container_width=True, height=280)
-
     st.plotly_chart(px.bar(agg.sort_values("ABS_PCT_APROX", ascending=False), x="GERENTE_RESPONSAVEL", y="ABS_PCT_APROX"), use_container_width=True)
     st.plotly_chart(px.bar(agg.sort_values("TEMPO_CASA_MEDIA", ascending=False), x="GERENTE_RESPONSAVEL", y="TEMPO_CASA_MEDIA"), use_container_width=True)
