@@ -1,7 +1,8 @@
 streamlit
 pandas
 numpy
+altair
+openpyxl
 gspread
 google-auth
-plotly
-python-dateutil
+google-api-python-client
