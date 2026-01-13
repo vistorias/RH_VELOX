@@ -15,7 +15,7 @@ from google.oauth2.service_account import Credentials
 # =========================
 st.set_page_config(page_title="Painel RH - VELOX", layout="wide")
 
-INDEX_SHEET_URL = "1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo"  # <- ajuste
+INDEX_SHEET_URL = "https://docs.google.com/spreadsheets/d/1N5D_ARAgpXMNsHKZZJBc1JGom5JUCG84cxiDxE3QcLo/edit?gid=0#gid=0"  # <- ajuste
 
 # Mapeamento gerencial informado por você
 GERENTE_POR_CIDADE = {
