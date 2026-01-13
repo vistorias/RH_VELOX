@@ -68,7 +68,6 @@ def _get_clients():
         st.error("Não encontrei [gcp_service_account] no secrets.toml.")
         st.stop()
 
-    # aceita json_path OU bloco direto
     if "json_path" in sa_block:
         path = sa_block["json_path"]
         if not os.path.isabs(path):
@@ -90,10 +89,7 @@ def _get_clients():
     ]
 
     creds = gcreds.Credentials.from_service_account_info(info, scopes=scopes)
-
-    # gspread com google-auth (sem oauth2client)
     gc = gspread.authorize(creds)
-
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
     return idx_id, gc, drive, info.get("client_email", "")
@@ -126,7 +122,6 @@ def parse_date_any(x):
     if pd.isna(x) or x == "":
         return pd.NaT
     if isinstance(x, (int, float)) and not isinstance(x, bool):
-        # excel serial
         try:
             return (pd.to_datetime("1899-12-30") + pd.to_timedelta(int(x), unit="D")).date()
         except Exception:
@@ -155,6 +150,40 @@ def _find_col(cols, *names) -> Optional[str]:
             return norm[key]
     return None
 
+def parse_month_to_ym(m: str) -> Optional[str]:
+    """
+    Aceita: "12/2025", "12-2025", "2025-12", "2025/12", "2025-12-01"
+    Retorna: "2025-12"
+    """
+    if m is None:
+        return None
+    s = str(m).strip()
+    if not s:
+        return None
+
+    # MM/YYYY
+    mm_yyyy = re.match(r"^(\d{1,2})\s*[\/\-]\s*(\d{4})$", s)
+    if mm_yyyy:
+        mm = int(mm_yyyy.group(1))
+        yy = int(mm_yyyy.group(2))
+        if 1 <= mm <= 12:
+            return f"{yy:04d}-{mm:02d}"
+
+    # YYYY-MM (ou YYYY/MM)
+    yyyy_mm = re.match(r"^(\d{4})\s*[\/\-]\s*(\d{1,2})$", s)
+    if yyyy_mm:
+        yy = int(yyyy_mm.group(1))
+        mm = int(yyyy_mm.group(2))
+        if 1 <= mm <= 12:
+            return f"{yy:04d}-{mm:02d}"
+
+    # tenta datetime
+    try:
+        dt = pd.to_datetime(s, errors="raise")
+        return f"{int(dt.year):04d}-{int(dt.month):02d}"
+    except Exception:
+        return None
+
 
 # ------------------ DRIVE HELPERS (cache) ------------------
 @st.cache_data(ttl=300, show_spinner=False)
@@ -177,7 +206,6 @@ def _drive_download_bytes(file_id: str) -> bytes:
 def read_index(sheet_id: str, tab: Optional[str] = None) -> pd.DataFrame:
     sh = client.open_by_key(sheet_id)
 
-    # se não informar tab, pega a primeira aba (evita WorksheetNotFound)
     if tab is None:
         tab = sh.worksheets()[0].title
 
@@ -195,11 +223,10 @@ def read_index(sheet_id: str, tab: Optional[str] = None) -> pd.DataFrame:
 
 # ------------------ LEITURA BASE RH DO MÊS (cache) ------------------
 @st.cache_data(ttl=300, show_spinner=False)
-def read_rh_month(file_id: str) -> Tuple[pd.DataFrame, str]:
+def read_rh_month(file_id: str, ym_from_index: str) -> Tuple[pd.DataFrame, str]:
     """
-    Lê a aba BASE GERAL de um arquivo mensal:
-    - se for Google Spreadsheet: abre direto e pega worksheet BASE GERAL
-    - se for XLSX no Drive: baixa bytes e lê BASE GERAL via openpyxl
+    Lê a aba BASE GERAL de um arquivo mensal (Google Sheet ou XLSX no Drive).
+    O mês (YM) é FORÇADO pelo índice (ym_from_index), evitando NaT.
     """
     meta = _drive_get_file_metadata(file_id)
     title = meta.get("name", file_id)
@@ -213,12 +240,12 @@ def read_rh_month(file_id: str) -> Tuple[pd.DataFrame, str]:
             raise RuntimeError(f"O arquivo '{title}' não possui aba 'BASE GERAL'.") from e
         df = pd.DataFrame(ws.get_all_records())
         if df.empty:
-            return pd.DataFrame(), title
+            out = pd.DataFrame()
+            out["YM"] = []
+            out["SRC_FILE"] = []
+            return out, title
         df.columns = [str(c).strip() for c in df.columns]
     else:
-        if not mime.startswith("application/vnd.openxmlformats-officedocument") and \
-           not mime.startswith("application/vnd.ms-excel"):
-            raise RuntimeError(f"Tipo de arquivo não suportado: {mime} ({title})")
         content = _drive_download_bytes(file_id)
         try:
             df = pd.read_excel(io.BytesIO(content), sheet_name="BASE GERAL", engine="openpyxl")
@@ -226,10 +253,8 @@ def read_rh_month(file_id: str) -> Tuple[pd.DataFrame, str]:
             raise RuntimeError(f"O arquivo '{title}' não possui aba 'BASE GERAL'.") from e
         df.columns = [str(c).strip() for c in df.columns]
 
-    # normalização de colunas (aceita variações)
     cols = list(df.columns)
 
-    c_mes     = _find_col(cols, "MÊS", "MES")
     c_cidade  = _find_col(cols, "CIDADE", "UNIDADE")
     c_nome    = _find_col(cols, "NOME DO COLABORADOR", "COLABORADOR", "NOME")
     c_cpf     = _find_col(cols, "CPF")
@@ -244,7 +269,6 @@ def read_rh_month(file_id: str) -> Tuple[pd.DataFrame, str]:
     c_superv  = _find_col(cols, "SUPERVISOR")
 
     out = pd.DataFrame()
-    out["MES_REF"] = df[c_mes] if c_mes else ""
     out["CIDADE"]  = df[c_cidade] if c_cidade else ""
     out["NOME"]    = df[c_nome] if c_nome else ""
     out["CPF"]     = df[c_cpf] if c_cpf else ""
@@ -258,7 +282,6 @@ def read_rh_month(file_id: str) -> Tuple[pd.DataFrame, str]:
     out["FALTAS_MES"] = df[c_faltas] if c_faltas else 0
     out["SUPERVISOR"] = df[c_superv] if c_superv else ""
 
-    # normaliza tipos
     out["CIDADE"] = out["CIDADE"].astype(str).map(_upper)
     out["NOME"] = out["NOME"].astype(str).str.strip()
     out["FUNCAO"] = out["FUNCAO"].astype(str).map(_upper)
@@ -271,70 +294,76 @@ def read_rh_month(file_id: str) -> Tuple[pd.DataFrame, str]:
     out["DIAS_UTEIS_MES"] = pd.to_numeric(out["DIAS_UTEIS_MES"], errors="coerce")
     out["FALTAS_MES"] = pd.to_numeric(out["FALTAS_MES"], errors="coerce").fillna(0).astype(int)
 
-    # tenta inferir mês (AAAA-MM) usando MES_REF (se vier como data)
-    mes_dt = pd.to_datetime(out["MES_REF"], errors="coerce")
-    out["YM"] = mes_dt.dt.to_period("M").astype(str)
-    out["SRC_FILE"] = title
-
-    # remove linhas vazias
     out = out[out["NOME"].astype(str).str.strip() != ""].copy()
+
+    # >>> MÊS FORÇADO PELO ÍNDICE <<<
+    out["YM"] = ym_from_index
+    out["SRC_FILE"] = title
 
     return out, title
 
 
-# ------------------ CARREGA ÍNDICE E BASES ------------------
-idx = read_index(RH_INDEX_ID)  # pega a primeira aba automaticamente
-idx = idx.copy()
+# ------------------ CARREGA ÍNDICE ------------------
+idx = read_index(RH_INDEX_ID).copy()
 idx["URL"] = idx["URL"].astype(str)
 idx["MÊS"] = idx["MÊS"].astype(str).str.strip()
 idx["ATIVO"] = idx["ATIVO"].astype(str)
 
-# filtra ativos
 idx = idx[idx["ATIVO"].map(_yes)].copy()
 if idx.empty:
     st.error("Seu índice não tem linhas ATIVAS (ATIVO = S).")
     st.stop()
 
-# carrega meses
+# normaliza YM a partir da coluna MÊS do índice
+idx["YM"] = idx["MÊS"].apply(parse_month_to_ym)
+idx = idx[~idx["YM"].isna()].copy()
+if idx.empty:
+    st.error("A coluna MÊS do índice não está em um formato reconhecido (ex: 12/2025).")
+    st.stop()
+
+# ------------------ CARREGA BASES DOS MESES ------------------
 ok_msgs, err_msgs = [], []
 all_months = []
+
 for _, r in idx.iterrows():
     fid = _sheet_id(r.get("URL", ""))
-    if not fid:
+    ym = r.get("YM", "")
+    if not fid or not ym:
         continue
     try:
-        d, ttl = read_rh_month(fid)
+        d, ttl = read_rh_month(fid, ym_from_index=ym)
         if not d.empty:
             all_months.append(d)
-        ok_msgs.append(f"{ttl} ({len(d)} linhas)")
+        ok_msgs.append(f"{ym} — {ttl} ({len(d)} linhas)")
     except Exception as e:
-        err_msgs.append((fid, e))
+        err_msgs.append((fid, ym, e))
 
 if not all_months:
     st.error("Não consegui ler nenhuma BASE GERAL dos meses (verifique links e permissões).")
     with st.expander("Erros"):
-        for fid, e in err_msgs:
-            st.write(fid)
+        for fid, ym, e in err_msgs:
+            st.write(f"{ym} — {fid}")
             st.exception(e)
     st.stop()
 
 df = pd.concat(all_months, ignore_index=True)
 
-# meses disponíveis
+# meses disponíveis (agora SEM NaT)
 ym_all = sorted(df["YM"].dropna().unique().tolist())
 if not ym_all:
-    st.error("Não consegui identificar os meses (YM) na base.")
+    st.error("Não encontrei meses válidos para o filtro.")
     st.stop()
 
-# ------------------ FILTROS PRINCIPAIS ------------------
-label_map = {f"{m[5:]}/{m[:4]}": m for m in ym_all}
+# ------------------ FILTRO MÊS ------------------
+label_map = {f"{m[5:]}/{m[:4]}": m for m in ym_all}  # MM/YYYY -> YYYY-MM
 sel_label = st.selectbox("Mês de referência", options=list(label_map.keys()), index=len(ym_all) - 1)
 ym_sel = label_map[sel_label]
+
 ref_year, ref_month = int(ym_sel[:4]), int(ym_sel[5:7])
 
 df_m = df[df["YM"] == ym_sel].copy()
 
-# período dentro do mês (por padrão: mês inteiro)
+# ------------------ PERÍODO NO MÊS ------------------
 month_start = date(ref_year, ref_month, 1)
 last_day = calendar.monthrange(ref_year, ref_month)[1]
 month_end = date(ref_year, ref_month, last_day)
@@ -350,7 +379,7 @@ with c1:
     )
 start_d, end_d = (drange if isinstance(drange, tuple) and len(drange) == 2 else (month_start, month_end))
 
-# filtros categóricos
+# ------------------ FILTROS CATEGÓRICOS ------------------
 cidades = sorted(df_m["CIDADE"].dropna().unique().tolist())
 funcoes = sorted(df_m["FUNCAO"].dropna().unique().tolist())
 status_opts = sorted(df_m["STATUS"].dropna().unique().tolist())
@@ -381,7 +410,7 @@ if view.empty:
     st.info("Sem dados no recorte selecionado.")
     st.stop()
 
-# ------------------ FUNÇÕES DE CÁLCULO (as-of) ------------------
+# ------------------ CÁLCULOS ------------------
 def is_active_asof(row, asof: date) -> bool:
     adm = row["ADMISSAO"]
     dem = row["DEMISSAO"]
@@ -399,27 +428,19 @@ def count_active_asof(df_in: pd.DataFrame, asof: date) -> int:
     mask = df_in.apply(lambda r: is_active_asof(r, asof), axis=1)
     return int(mask.sum())
 
-
-# ------------------ KPIs ------------------
-# headcount no início/fim do período
 hc_start = count_active_asof(view, start_d)
 hc_end = count_active_asof(view, end_d)
 hc_avg = (hc_start + hc_end) / 2 if (hc_start + hc_end) > 0 else 0
 
-# admissões/demissões no período
 adm_period = view[view["ADMISSAO"].apply(lambda d: isinstance(d, date) and start_d <= d <= end_d)]
 dem_period = view[view["DEMISSAO"].apply(lambda d: isinstance(d, date) and start_d <= d <= end_d)]
-
 n_adm = int(len(adm_period))
 n_dem = int(len(dem_period))
 
-# turnover (%): ((adm + dem)/2) / headcount_medio * 100
 turnover = np.nan
 if hc_avg > 0:
     turnover = (((n_adm + n_dem) / 2) / hc_avg) * 100
 
-# absenteísmo (mensal aproximado pelo campo FALTAS_MES e DIAS_UTEIS_MES)
-# taxa = total faltas / (headcount médio * dias úteis mês) * 100
 du_mes = pd.to_numeric(view["DIAS_UTEIS_MES"], errors="coerce").dropna()
 dias_uteis_mes = int(du_mes.mode().iloc[0]) if len(du_mes) else business_days_count(month_start, month_end)
 
@@ -430,7 +451,6 @@ den_abs = hc_end * dias_uteis_mes
 if den_abs > 0:
     abs_rate = (faltas_total_mes / den_abs) * 100
 
-# pendências: sem admissão válida ou sem função etc.
 pend_cadastro = int((view["ADMISSAO"].isna() | (view["FUNCAO"].astype(str).str.strip() == "")).sum())
 
 def fmt_pct(x):
@@ -454,7 +474,7 @@ cards_html = f"""
   <div class='card'>
     <h4>Turnover (período)</h4>
     <h2>{fmt_pct(turnover)}</h2>
-    <span class='sub neu'>fórmula: ((adm+dem)/2)/HC médio</span>
+    <span class='sub neu'>((adm+dem)/2)/HC médio</span>
   </div>
   <div class='card'>
     <h4>Faltas (mês)</h4>
@@ -468,7 +488,6 @@ cards_html = f"""
 </div>
 """
 st.markdown(cards_html.replace(",", "."), unsafe_allow_html=True)
-
 
 # ------------------ GRÁFICOS ------------------
 def bar_with_labels(df_plot, x_col, y_col, height=320, x_title="", y_title="QTD"):
@@ -485,7 +504,6 @@ g1, g2 = st.columns(2)
 
 with g1:
     st.markdown("<div class='section'>Headcount por função (fim do período)</div>", unsafe_allow_html=True)
-    # calcula ativos como-of end_d
     tmp = view.copy()
     tmp["ATIVO_ASOF"] = tmp.apply(lambda r: 1 if is_active_asof(r, end_d) else 0, axis=1)
     by_func = tmp.groupby("FUNCAO")["ATIVO_ASOF"].sum().reset_index(name="QTD").sort_values("QTD", ascending=False)
@@ -501,10 +519,7 @@ with g2:
     m = a.merge(d, on="FUNCAO", how="outer").fillna(0)
     m["ADM"] = m["ADM"].astype(int)
     m["DEM"] = m["DEM"].astype(int)
-    m = m.sort_values("ADM", ascending=False)
-
     if len(m):
-        # barras lado a lado
         m_long = m.melt(id_vars=["FUNCAO"], value_vars=["ADM", "DEM"], var_name="TIPO", value_name="QTD")
         chart = alt.Chart(m_long).mark_bar().encode(
             x=alt.X("FUNCAO:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=220), title="FUNÇÃO"),
@@ -531,7 +546,7 @@ if not fast_mode:
     else:
         st.info("Sem faltas.")
 
-# ------------------ TABELA BASE + EXPORTAÇÃO ------------------
+# ------------------ TABELA + EXPORTAÇÃO ------------------
 st.markdown("<div class='section'>Base (recorte atual)</div>", unsafe_allow_html=True)
 
 cols_show = [
@@ -545,13 +560,11 @@ for c in cols_show:
 df_show = view[cols_show].copy()
 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-# export excel do recorte
 try:
     import openpyxl  # noqa
     xbuf = io.BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
         df_show.to_excel(writer, index=False, sheet_name="BASE_RECORTE")
-        # resumo
         resumo = pd.DataFrame(
             {
                 "Métrica": ["Headcount fim", "Headcount início", "Headcount médio", "Admissões", "Demissões", "Turnover %", "Faltas", "Absenteísmo %"],
@@ -575,12 +588,11 @@ try:
 except Exception:
     st.caption("<span class='small'>Exportação Excel indisponível no ambiente.</span>", unsafe_allow_html=True)
 
-# ------------------ DIAGNÓSTICO (opcional) ------------------
 with st.expander("Diagnóstico", expanded=False):
     st.write("Service account:", SA_EMAIL)
     st.write("Meses carregados:", ym_all)
     if err_msgs:
         st.write("Falhas ao carregar alguns arquivos:")
-        for fid, e in err_msgs:
-            st.write(fid)
+        for fid, ym, e in err_msgs:
+            st.write(f"{ym} — {fid}")
             st.exception(e)
