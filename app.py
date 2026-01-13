@@ -118,25 +118,6 @@ def _upper(x):
 def _yes(v) -> bool:
     return str(v).strip().upper() in {"S", "SIM", "Y", "YES", "TRUE", "1"}
 
-def parse_date_any(x):
-    if pd.isna(x) or x == "":
-        return pd.NaT
-    if isinstance(x, (int, float)) and not isinstance(x, bool):
-        try:
-            return (pd.to_datetime("1899-12-30") + pd.to_timedelta(int(x), unit="D")).date()
-        except Exception:
-            pass
-    s = str(x).strip()
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            pass
-    try:
-        return pd.to_datetime(s).date()
-    except Exception:
-        return pd.NaT
-
 def business_days_count(dini: date, dfim: date) -> int:
     if not (isinstance(dini, date) and isinstance(dfim, date) and dini <= dfim):
         return 0
@@ -161,7 +142,6 @@ def parse_month_to_ym(m: str) -> Optional[str]:
     if not s:
         return None
 
-    # MM/YYYY
     mm_yyyy = re.match(r"^(\d{1,2})\s*[\/\-]\s*(\d{4})$", s)
     if mm_yyyy:
         mm = int(mm_yyyy.group(1))
@@ -169,7 +149,6 @@ def parse_month_to_ym(m: str) -> Optional[str]:
         if 1 <= mm <= 12:
             return f"{yy:04d}-{mm:02d}"
 
-    # YYYY-MM (ou YYYY/MM)
     yyyy_mm = re.match(r"^(\d{4})\s*[\/\-]\s*(\d{1,2})$", s)
     if yyyy_mm:
         yy = int(yyyy_mm.group(1))
@@ -177,12 +156,35 @@ def parse_month_to_ym(m: str) -> Optional[str]:
         if 1 <= mm <= 12:
             return f"{yy:04d}-{mm:02d}"
 
-    # tenta datetime
     try:
         dt = pd.to_datetime(s, errors="raise")
         return f"{int(dt.year):04d}-{int(dt.month):02d}"
     except Exception:
         return None
+
+def to_ts(x) -> pd.Timestamp:
+    """
+    Normaliza qualquer valor de data para pd.Timestamp (normalizado) ou NaT.
+    Evita TypeError de comparação (Timestamp vs date).
+    """
+    if x is None or (isinstance(x, str) and not x.strip()):
+        return pd.NaT
+    if pd.isna(x):
+        return pd.NaT
+    try:
+        if isinstance(x, pd.Timestamp):
+            return x.normalize()
+        if isinstance(x, datetime):
+            return pd.Timestamp(x.date())
+        if isinstance(x, date):
+            return pd.Timestamp(x)
+        # números (Excel serial)
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            base = pd.Timestamp("1899-12-30")
+            return (base + pd.to_timedelta(int(x), unit="D")).normalize()
+        return pd.to_datetime(x, errors="coerce").normalize()
+    except Exception:
+        return pd.NaT
 
 
 # ------------------ DRIVE HELPERS (cache) ------------------
@@ -288,15 +290,16 @@ def read_rh_month(file_id: str, ym_from_index: str) -> Tuple[pd.DataFrame, str]:
     out["STATUS"] = out["STATUS"].astype(str).map(_upper)
     out["SUPERVISOR"] = out["SUPERVISOR"].astype(str).map(_upper)
 
-    out["ADMISSAO"] = out["ADMISSAO"].apply(parse_date_any)
-    out["DEMISSAO"] = out["DEMISSAO"].apply(parse_date_any)
+    # Normaliza datas para Timestamp (evita TypeError)
+    out["ADMISSAO"] = out["ADMISSAO"].apply(to_ts)
+    out["DEMISSAO"] = out["DEMISSAO"].apply(to_ts)
 
     out["DIAS_UTEIS_MES"] = pd.to_numeric(out["DIAS_UTEIS_MES"], errors="coerce")
     out["FALTAS_MES"] = pd.to_numeric(out["FALTAS_MES"], errors="coerce").fillna(0).astype(int)
 
     out = out[out["NOME"].astype(str).str.strip() != ""].copy()
 
-    # >>> MÊS FORÇADO PELO ÍNDICE <<<
+    # MÊS FORÇADO PELO ÍNDICE
     out["YM"] = ym_from_index
     out["SRC_FILE"] = title
 
@@ -314,12 +317,12 @@ if idx.empty:
     st.error("Seu índice não tem linhas ATIVAS (ATIVO = S).")
     st.stop()
 
-# normaliza YM a partir da coluna MÊS do índice
 idx["YM"] = idx["MÊS"].apply(parse_month_to_ym)
 idx = idx[~idx["YM"].isna()].copy()
 if idx.empty:
     st.error("A coluna MÊS do índice não está em um formato reconhecido (ex: 12/2025).")
     st.stop()
+
 
 # ------------------ CARREGA BASES DOS MESES ------------------
 ok_msgs, err_msgs = [], []
@@ -348,11 +351,11 @@ if not all_months:
 
 df = pd.concat(all_months, ignore_index=True)
 
-# meses disponíveis (agora SEM NaT)
 ym_all = sorted(df["YM"].dropna().unique().tolist())
 if not ym_all:
     st.error("Não encontrei meses válidos para o filtro.")
     st.stop()
+
 
 # ------------------ FILTRO MÊS ------------------
 label_map = {f"{m[5:]}/{m[:4]}": m for m in ym_all}  # MM/YYYY -> YYYY-MM
@@ -362,6 +365,7 @@ ym_sel = label_map[sel_label]
 ref_year, ref_month = int(ym_sel[:4]), int(ym_sel[5:7])
 
 df_m = df[df["YM"] == ym_sel].copy()
+
 
 # ------------------ PERÍODO NO MÊS ------------------
 month_start = date(ref_year, ref_month, 1)
@@ -378,6 +382,7 @@ with c1:
         format="DD/MM/YYYY",
     )
 start_d, end_d = (drange if isinstance(drange, tuple) and len(drange) == 2 else (month_start, month_end))
+
 
 # ------------------ FILTROS CATEGÓRICOS ------------------
 cidades = sorted(df_m["CIDADE"].dropna().unique().tolist())
@@ -410,30 +415,40 @@ if view.empty:
     st.info("Sem dados no recorte selecionado.")
     st.stop()
 
-# ------------------ CÁLCULOS ------------------
-def is_active_asof(row, asof: date) -> bool:
-    adm = row["ADMISSAO"]
-    dem = row["DEMISSAO"]
-    if not isinstance(adm, date):
+
+# ------------------ CÁLCULOS (CORRIGIDO) ------------------
+def is_active_asof(row, asof_d: date) -> bool:
+    asof = pd.Timestamp(asof_d).normalize()
+    adm = row.get("ADMISSAO", pd.NaT)
+    dem = row.get("DEMISSAO", pd.NaT)
+
+    adm = to_ts(adm)
+    dem = to_ts(dem)
+
+    if pd.isna(adm):
         return False
     if adm > asof:
         return False
-    if isinstance(dem, date) and dem <= asof:
+    if not pd.isna(dem) and dem <= asof:
         return False
     return True
 
-def count_active_asof(df_in: pd.DataFrame, asof: date) -> int:
+def count_active_asof(df_in: pd.DataFrame, asof_d: date) -> int:
     if df_in.empty:
         return 0
-    mask = df_in.apply(lambda r: is_active_asof(r, asof), axis=1)
+    mask = df_in.apply(lambda r: is_active_asof(r, asof_d), axis=1)
     return int(mask.sum())
 
 hc_start = count_active_asof(view, start_d)
 hc_end = count_active_asof(view, end_d)
 hc_avg = (hc_start + hc_end) / 2 if (hc_start + hc_end) > 0 else 0
 
-adm_period = view[view["ADMISSAO"].apply(lambda d: isinstance(d, date) and start_d <= d <= end_d)]
-dem_period = view[view["DEMISSAO"].apply(lambda d: isinstance(d, date) and start_d <= d <= end_d)]
+start_ts = pd.Timestamp(start_d).normalize()
+end_ts = pd.Timestamp(end_d).normalize()
+
+adm_period = view[(view["ADMISSAO"].notna()) & (view["ADMISSAO"] >= start_ts) & (view["ADMISSAO"] <= end_ts)]
+dem_period = view[(view["DEMISSAO"].notna()) & (view["DEMISSAO"] >= start_ts) & (view["DEMISSAO"] <= end_ts)]
+
 n_adm = int(len(adm_period))
 n_dem = int(len(dem_period))
 
@@ -488,6 +503,7 @@ cards_html = f"""
 </div>
 """
 st.markdown(cards_html.replace(",", "."), unsafe_allow_html=True)
+
 
 # ------------------ GRÁFICOS ------------------
 def bar_with_labels(df_plot, x_col, y_col, height=320, x_title="", y_title="QTD"):
@@ -546,6 +562,7 @@ if not fast_mode:
     else:
         st.info("Sem faltas.")
 
+
 # ------------------ TABELA + EXPORTAÇÃO ------------------
 st.markdown("<div class='section'>Base (recorte atual)</div>", unsafe_allow_html=True)
 
@@ -558,6 +575,11 @@ for c in cols_show:
         view[c] = ""
 
 df_show = view[cols_show].copy()
+
+# formata datas para exibição
+for c in ["ADMISSAO", "DEMISSAO"]:
+    df_show[c] = pd.to_datetime(df_show[c], errors="coerce").dt.strftime("%d/%m/%Y")
+
 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 try:
