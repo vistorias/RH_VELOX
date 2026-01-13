@@ -333,21 +333,37 @@ def build_treinamentos(df_tr: pd.DataFrame) -> pd.DataFrame:
 
 def compute_metrics(df_base: pd.DataFrame, df_pres: pd.DataFrame, df_tr: pd.DataFrame, mes_ref: str):
     headcount = len(df_base)
-    ativos = int((df_base["STATUS"] == "ATIVO").sum()) if "STATUS" in df_base.columns else headcount
+
+    # status
+    if "STATUS" in df_base.columns:
+        status_norm = df_base["STATUS"].astype(str).str.upper().str.strip()
+        ativos = int((status_norm == "ATIVO").sum())
+    else:
+        ativos = headcount
     desligados_total = headcount - ativos
 
+    # período do mês
     start, end = month_start_end(mes_ref)
+
+    # ✅ força datetime aqui (mesmo que já tenha vindo certo)
     entradas = 0
     saidas = 0
 
     if "DT_ADMISSAO" in df_base.columns:
-        entradas = int(((df_base["DT_ADMISSAO"].dt.date >= start) & (df_base["DT_ADMISSAO"].dt.date <= end)).sum())
+        adm = pd.to_datetime(df_base["DT_ADMISSAO"], errors="coerce", dayfirst=True)
+        entradas = int(((adm.dt.date >= start) & (adm.dt.date <= end)).sum())
+
     if "DT_DEMISSAO" in df_base.columns:
-        saidas = int(((df_base["DT_DEMISSAO"].dt.date >= start) & (df_base["DT_DEMISSAO"].dt.date <= end)).sum())
+        dem = pd.to_datetime(df_base["DT_DEMISSAO"], errors="coerce", dayfirst=True)
+        saidas = int(((dem.dt.date >= start) & (dem.dt.date <= end)).sum())
 
+    # turnover
     turnover = (((entradas + saidas) / 2) / headcount * 100) if headcount else 0
-    faltas_total = float(df_pres["FALTAS_TOTAL"].sum()) if not df_pres.empty else 0.0
 
+    # faltas
+    faltas_total = float(df_pres["FALTAS_TOTAL"].sum()) if (df_pres is not None and not df_pres.empty) else 0.0
+
+    # dias úteis
     dias_uteis = 22
     if "DIAS_UTEIS" in df_base.columns:
         du = pd.to_numeric(df_base["DIAS_UTEIS"], errors="coerce").dropna()
@@ -356,7 +372,8 @@ def compute_metrics(df_base: pd.DataFrame, df_pres: pd.DataFrame, df_tr: pd.Data
 
     abs_pct = (faltas_total / (headcount * dias_uteis) * 100) if headcount and dias_uteis else 0
 
-    if not df_tr.empty:
+    # treinamento
+    if df_tr is not None and not df_tr.empty and "PRESENCA_OK" in df_tr.columns:
         pres_ok = int(df_tr["PRESENCA_OK"].sum())
         treino_pct = pres_ok / headcount * 100 if headcount else 0
     else:
@@ -378,7 +395,6 @@ def compute_metrics(df_base: pd.DataFrame, df_pres: pd.DataFrame, df_tr: pd.Data
         "periodo_inicio": start,
         "periodo_fim": end,
     }
-
 
 def add_age_tenure(df: pd.DataFrame, ref_date: date):
     out = df.copy()
