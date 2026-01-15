@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Painel de RH — VELOX (multi-meses via Índice no Google Sheets)
+# + Treinamentos (aba TREINAMENTOS) + Padronização de Funções
 # ============================================================
 
 import os
@@ -10,7 +11,7 @@ import json
 import unicodedata
 import calendar
 from datetime import datetime, date
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import streamlit as st
 import pandas as pd
@@ -100,6 +101,11 @@ def _strip_accents(s: str) -> str:
         return ""
     return "".join(ch for ch in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(ch))
 
+def _norm_key(s: str) -> str:
+    s = _strip_accents(str(s or "")).upper().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
 def _upper(x):
     return str(x).upper().strip() if pd.notna(x) else ""
 
@@ -165,49 +171,58 @@ def to_ts(x) -> pd.Timestamp:
     except Exception:
         return pd.NaT
 
-def safe_div(a, b):
-    return np.nan if b == 0 else a / b
-
 def fmt_pct(x):
     return "—" if pd.isna(x) else f"{x:.1f}%".replace(".", ",")
 
-def normalize_role(role: str) -> str:
-    r = _upper(role)
-    r = r.replace(".", "").replace("-", " ").replace("_", " ").strip()
-    r = re.sub(r"\s+", " ", r)
+def normalize_cidade(x: str) -> str:
+    s = _norm_key(x)
+    # remove prefixos comuns na aba de treinamentos
+    s = re.sub(r"^(MATRIZ\s*-\s*)", "", s)
+    s = re.sub(r"^(UNIDADE\s*-\s*)", "", s)
+    s = s.strip()
+    # normaliza variações
+    s = s.replace("SAO LUIS", "SÃO LUÍS")
+    s = s.replace("GRAJAU", "GRAJAÚ")
+    return s
 
-    # VISTORIADOR (vistoriador / vistoriador móvel / vistoriadora)
-    if "VISTORIADOR" in r:
+def normalize_funcao(x: str) -> str:
+    """
+    Regras pedidas:
+    - VISTORIADOR / VISTORIADOR MÓVEL / VISTORIADORA -> VISTORIADOR
+    - ANALISTA / ANALISTA I / ANALISTA II -> ANALISTA
+    Mantém outras funções como estão, só normaliza.
+    """
+    s = _norm_key(x)
+
+    # vistoriador (pega VISTORIADORA, VISTORIADOR MOVEL, etc.)
+    if re.search(r"\bVISTORIADOR", s) or re.search(r"\bVISTORIADORA\b", s):
         return "VISTORIADOR"
 
-    # ANALISTA (analista / analista i / ii / iii)
-    if r.startswith("ANALISTA"):
+    # analista (pega ANALISTA I/II)
+    if re.search(r"\bANALISTA\b", s):
         return "ANALISTA"
 
-    # SUPERVISOR
-    if r.startswith("SUPERVISOR"):
-        return "SUPERVISOR"
+    # você pode acrescentar mais padrões aqui se quiser no futuro
+    return s
 
-    # ATENDENTE
-    if r.startswith("ATENDENTE"):
-        return "ATENDENTE"
+def normalize_nome(x: str) -> str:
+    return _norm_key(x)
 
-    # SERVIÇOS GERAIS
-    if ("SERVI" in r and "GERAIS" in r) or r in {"SG", "SERVICOS GERAIS", "SERVIÇOS GERAIS"}:
-        return "SERVIÇOS GERAIS"
+def safe_int(x, default=0):
+    try:
+        if pd.isna(x):
+            return default
+        return int(float(str(x).replace(",", ".")))
+    except Exception:
+        return default
 
-    # GERENTE
-    if r.startswith("GERENTE"):
-        return "GERENTE"
-
-    return r
-
-def key_person(cpf: str, nome: str) -> str:
-    cpf = str(cpf).strip()
-    nm = _upper(nome)
-    if cpf and cpf not in {"NAN", "NONE"}:
-        return f"CPF:{cpf}"
-    return f"NOME:{nm}"
+def presence_to_bool(x) -> Optional[bool]:
+    s = _norm_key(x)
+    if s in {"SIM", "S", "PRESENTE", "TRUE", "1"}:
+        return True
+    if s in {"NAO", "NÃO", "N", "AUSENTE", "FALSE", "0"}:
+        return False
+    return None
 
 
 # ------------------ DRIVE (cache) ------------------
@@ -240,6 +255,53 @@ def read_index(sheet_id: str, tab: Optional[str] = None) -> pd.DataFrame:
         if need not in df.columns:
             df[need] = ""
     return df
+
+
+# ------------------ UTIL: achar aba por "aproximação" ------------------
+def _best_sheet_name(sheet_names: List[str], wanted_tokens: List[str]) -> Optional[str]:
+    """
+    Retorna o nome de aba que mais combina com tokens (ex: ["TREIN"]).
+    """
+    if not sheet_names:
+        return None
+    norm_map = {name: _norm_key(name) for name in sheet_names}
+    # prioridade: começa com token
+    for token in wanted_tokens:
+        for name, nrm in norm_map.items():
+            if nrm.startswith(token):
+                return name
+    # contém token
+    for token in wanted_tokens:
+        for name, nrm in norm_map.items():
+            if token in nrm:
+                return name
+    return None
+
+def _read_excel_with_header_guess(content_bytes: bytes, sheet_name: str, max_try: int = 5) -> pd.DataFrame:
+    """
+    Algumas abas (como TREINAMENTOS) podem ter 2-3 linhas "soltas" antes do cabeçalho real.
+    Aqui tentamos header=0..max_try e escolhemos a leitura com mais colunas "úteis".
+    """
+    best_df = pd.DataFrame()
+    best_score = -1
+
+    for h in range(0, max_try + 1):
+        try:
+            df = pd.read_excel(io.BytesIO(content_bytes), sheet_name=sheet_name, engine="openpyxl", header=h)
+            if df is None or df.empty:
+                continue
+            cols = [str(c) for c in df.columns]
+            # score: quantas colunas não são "Unnamed"
+            score = sum([0 if str(c).lower().startswith("unnamed") else 1 for c in cols])
+            # penaliza se quase tudo é unnamed
+            if score > best_score:
+                best_score = score
+                best_df = df.copy()
+        except Exception:
+            continue
+
+    # fallback
+    return best_df
 
 
 # ------------------ LEITURA BASE RH DO MÊS ------------------
@@ -293,10 +355,10 @@ def read_rh_month(file_id: str, ym_from_index: str) -> Tuple[pd.DataFrame, str]:
     out["FALTAS_MES"] = df[c_faltas] if c_faltas else 0
     out["SUPERVISOR"] = df[c_superv] if c_superv else ""
 
-    out["CIDADE"] = out["CIDADE"].astype(str).map(_upper)
+    out["CIDADE"] = out["CIDADE"].astype(str).map(_upper).map(normalize_cidade)
     out["NOME"] = out["NOME"].astype(str).str.strip()
     out["CPF"] = out["CPF"].astype(str).str.strip()
-    out["FUNCAO"] = out["FUNCAO"].astype(str).map(_upper)
+    out["FUNCAO"] = out["FUNCAO"].astype(str).map(normalize_funcao)
     out["STATUS"] = out["STATUS"].astype(str).map(_upper)
     out["SUPERVISOR"] = out["SUPERVISOR"].astype(str).map(_upper)
 
@@ -309,10 +371,11 @@ def read_rh_month(file_id: str, ym_from_index: str) -> Tuple[pd.DataFrame, str]:
 
     out = out[out["NOME"].astype(str).str.strip() != ""].copy()
 
-    out["FUNCAO_PAD"] = out["FUNCAO"].astype(str).apply(normalize_role)
-
     out["YM"] = ym_from_index
     out["SRC_FILE"] = title
+
+    # chave de join com treinamentos
+    out["NOME_KEY"] = out["NOME"].apply(normalize_nome)
 
     return out, title
 
@@ -321,82 +384,99 @@ def read_rh_month(file_id: str, ym_from_index: str) -> Tuple[pd.DataFrame, str]:
 @st.cache_data(ttl=300, show_spinner=False)
 def read_training_month(file_id: str, ym_from_index: str) -> Tuple[pd.DataFrame, str]:
     """
-    Tenta ler aba TREINAMENTOS.
-    Se não existir, retorna DF vazio (sem quebrar).
+    Lê a aba de treinamentos (TREINAMENTOS) se existir.
+    Retorna DF com colunas padronizadas:
+      YM, SRC_FILE, CIDADE, NOME, NOME_KEY, CONVOCADO, PRESENCA_BOOL, TREINAMENTO_NOME, AREA_SETOR
     """
     meta = _drive_get_file_metadata(file_id)
     title = meta.get("name", file_id)
     mime = meta.get("mimeType", "")
 
-    try:
-        if mime == "application/vnd.google-apps.spreadsheet":
-            sh = client.open_by_key(file_id)
-            ws = sh.worksheet("TREINAMENTOS")
-            df = pd.DataFrame(ws.get_all_records())
-        else:
-            content = _drive_download_bytes(file_id)
-            df = pd.read_excel(io.BytesIO(content), sheet_name="TREINAMENTOS", engine="openpyxl")
-    except Exception:
-        empty = pd.DataFrame(columns=["YM", "SRC_FILE"])
-        empty["YM"] = []
-        empty["SRC_FILE"] = []
-        return empty, title
+    df_raw = pd.DataFrame()
 
-    if df is None or df.empty:
-        empty = pd.DataFrame(columns=["YM", "SRC_FILE"])
-        empty["YM"] = []
-        empty["SRC_FILE"] = []
-        return empty, title
+    if mime == "application/vnd.google-apps.spreadsheet":
+        sh = client.open_by_key(file_id)
+        ws_names = [w.title for w in sh.worksheets()]
+        tname = _best_sheet_name(ws_names, ["TREIN", "TREINAMENTO"])
+        if not tname:
+            out = pd.DataFrame()
+            out["YM"] = []
+            out["SRC_FILE"] = []
+            return out, title
+        ws = sh.worksheet(tname)
+        df_raw = pd.DataFrame(ws.get_all_records())
+    else:
+        content = _drive_download_bytes(file_id)
+        # tenta achar nome de aba (TREINAMENTOS, TREINAMENTO, etc.)
+        try:
+            xl = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+            tname = _best_sheet_name(xl.sheet_names, ["TREIN", "TREINAMENTO"])
+            if not tname:
+                out = pd.DataFrame()
+                out["YM"] = []
+                out["SRC_FILE"] = []
+                return out, title
+        except Exception:
+            tname = "TREINAMENTOS"
 
-    df.columns = [str(c).strip() for c in df.columns]
-    cols = list(df.columns)
+        df_raw = _read_excel_with_header_guess(content, sheet_name=tname, max_try=6)
 
-    c_data = _find_col(cols, "DATA", "DATA DO TREINAMENTO", "DIA", "DATA_REALIZACAO", "DATA REALIZAÇÃO")
-    c_tema = _find_col(cols, "TREINAMENTO", "TEMA", "CURSO", "ASSUNTO", "NOME DO TREINAMENTO")
-    c_nome = _find_col(cols, "NOME", "COLABORADOR", "PARTICIPANTE", "NOME DO COLABORADOR")
-    c_cpf  = _find_col(cols, "CPF")
+    if df_raw is None or df_raw.empty:
+        out = pd.DataFrame()
+        out["YM"] = []
+        out["SRC_FILE"] = []
+        return out, title
+
+    df_raw.columns = [str(c).strip() for c in df_raw.columns]
+    cols = list(df_raw.columns)
+
     c_cidade = _find_col(cols, "CIDADE", "UNIDADE")
-    c_status = _find_col(cols, "STATUS", "PRESENÇA", "PRESENCA", "PARTICIPOU", "PRESENTE", "SITUAÇÃO", "SITUACAO")
+    c_nome   = _find_col(cols, "NOME", "NOME DO COLABORADOR", "COLABORADOR")
+    c_conv   = _find_col(cols, "CONVOCADO TREINAMENTO", "CONVOCADO", "CONVOCADO PARA TREINAMENTO")
+    c_pres   = _find_col(cols, "PRESENÇA TREINAMENTO", "PRESENCA TREINAMENTO", "PRESENÇA", "PRESENCA")
+
+    # nomes de treinamento
+    c_t1 = _find_col(cols, "NOME DO TREINAMENTO TRIMESTRAL", "NOME DO TREINAMENTO", "TREINAMENTO")
+    c_t2 = _find_col(cols, "NOME DO TREINAMENTO SOLICITADO", "TREINAMENTO SOLICITADO")
+
+    c_area = _find_col(cols, "AREA/ SETOR", "AREA", "SETOR", "ÁREA/SETOR")
 
     out = pd.DataFrame()
-    out["DATA"] = df[c_data] if c_data else pd.NaT
-    out["TREINAMENTO"] = df[c_tema] if c_tema else ""
-    out["NOME"] = df[c_nome] if c_nome else ""
-    out["CPF"] = df[c_cpf] if c_cpf else ""
-    out["CIDADE"] = df[c_cidade] if c_cidade else ""
-    out["STATUS"] = df[c_status] if c_status else ""
+    out["CIDADE"] = df_raw[c_cidade] if c_cidade else ""
+    out["NOME"] = df_raw[c_nome] if c_nome else ""
+    out["CONVOCADO"] = df_raw[c_conv] if c_conv else 0
+    out["PRESENCA_RAW"] = df_raw[c_pres] if c_pres else ""
 
-    out["DATA"] = out["DATA"].apply(to_ts)
-    out["TREINAMENTO"] = out["TREINAMENTO"].astype(str).str.strip()
+    # nome do treinamento: preferir trimestral, senão solicitado
+    t_series = None
+    if c_t1 and c_t2:
+        t1 = df_raw[c_t1].astype(str)
+        t2 = df_raw[c_t2].astype(str)
+        t_series = np.where((t1.str.strip() != "") & (t1.str.lower() != "nan"), t1, t2)
+        out["TREINAMENTO_NOME"] = pd.Series(t_series)
+    elif c_t1:
+        out["TREINAMENTO_NOME"] = df_raw[c_t1]
+    elif c_t2:
+        out["TREINAMENTO_NOME"] = df_raw[c_t2]
+    else:
+        out["TREINAMENTO_NOME"] = ""
+
+    out["AREA_SETOR"] = df_raw[c_area] if c_area else ""
+
+    out["CIDADE"] = out["CIDADE"].astype(str).map(_upper).map(normalize_cidade)
     out["NOME"] = out["NOME"].astype(str).str.strip()
-    out["CPF"] = out["CPF"].astype(str).str.strip()
-    out["CIDADE"] = out["CIDADE"].astype(str).map(_upper)
-    out["STATUS"] = out["STATUS"].astype(str).map(_upper)
+    out["NOME_KEY"] = out["NOME"].apply(normalize_nome)
+    out["CONVOCADO"] = out["CONVOCADO"].apply(safe_int)
+    out["PRESENCA_BOOL"] = out["PRESENCA_RAW"].apply(presence_to_bool)
+    out["TREINAMENTO_NOME"] = out["TREINAMENTO_NOME"].astype(str).str.strip()
+    out["AREA_SETOR"] = out["AREA_SETOR"].astype(str).str.strip()
 
-    # Flag de presença (flexível)
-    def _present(x: str) -> int:
-        s = _upper(x)
-        if s in {"PRESENTE", "SIM", "S", "OK", "REALIZADO", "CONCLUIDO", "CONCLUÍDO", "PARTICIPOU"}:
-            return 1
-        if "PRESENTE" in s:
-            return 1
-        # se não tem coluna status, consideramos 1 (registro já é presença)
-        if s == "" or s in {"NAN", "NONE"}:
-            return 1
-        # ausências explícitas
-        if s in {"AUSENTE", "NAO", "NÃO", "N"}:
-            return 0
-        # padrão: assume presença
-        return 1
-
-    out["PRESENTE"] = out["STATUS"].apply(_present)
-
-    # remove linhas sem identificação e sem tema
-    out = out[(out["NOME"].astype(str).str.strip() != "") | (out["CPF"].astype(str).str.strip() != "")]
-    out = out[out["TREINAMENTO"].astype(str).str.strip() != ""]
+    # limpa linhas vazias
+    out = out[out["NOME"].astype(str).str.strip() != ""].copy()
 
     out["YM"] = ym_from_index
     out["SRC_FILE"] = title
+
     return out, title
 
 
@@ -405,17 +485,15 @@ CITY_TO_GERENTE = {
     "IMPERATRIZ": "JORGE ALEXANDRE",
     "ESTREITO": "JORGE ALEXANDRE",
     "SÃO LUÍS": "MOISÉS NASCIMENTO",
-    "SAO LUIS": "MOISÉS NASCIMENTO",
     "PEDREIRAS": "MOISÉS NASCIMENTO",
     "GRAJAÚ": "MOISÉS NASCIMENTO",
-    "GRAJAU": "MOISÉS NASCIMENTO",
 }
 
 def infer_gerente(cidade: str, supervisor: str) -> str:
     sup = _upper(supervisor)
     if sup and sup not in {"NAN", "NONE"}:
         return sup
-    return CITY_TO_GERENTE.get(_upper(cidade), "NÃO DEFINIDO")
+    return CITY_TO_GERENTE.get(normalize_cidade(cidade), "NÃO DEFINIDO")
 
 
 # ------------------ LOAD ÍNDICE ------------------
@@ -436,7 +514,7 @@ if idx.empty:
     st.stop()
 
 
-# ------------------ LOAD MESES (RH + TREINOS) ------------------
+# ------------------ LOAD MESES ------------------
 ok_msgs, err_msgs = [], []
 all_months = []
 all_train = []
@@ -446,28 +524,30 @@ for _, r in idx.iterrows():
     ym = r.get("YM", "")
     if not fid or not ym:
         continue
+
     try:
         d, ttl = read_rh_month(fid, ym_from_index=ym)
         if not d.empty:
             all_months.append(d)
-        ok_msgs.append(f"{ym} — {ttl} ({len(d)} linhas RH)")
+        ok_msgs.append(f"{ym} — {ttl} (BASE GERAL: {len(d)} linhas)")
     except Exception as e:
-        err_msgs.append((fid, ym, e))
+        err_msgs.append((fid, ym, f"BASE GERAL: {e}"))
 
-    # tenta treinos (não quebra se não existir)
+    # treinamentos (se existir)
     try:
-        tr, _ = read_training_month(fid, ym_from_index=ym)
-        if tr is not None and len(tr):
-            all_train.append(tr)
-    except Exception:
-        pass
+        tdf, ttl2 = read_training_month(fid, ym_from_index=ym)
+        if tdf is not None and not tdf.empty:
+            all_train.append(tdf)
+            ok_msgs.append(f"{ym} — {ttl2} (TREINAMENTOS: {len(tdf)} linhas)")
+    except Exception as e:
+        # não derruba o app por treinamentos
+        err_msgs.append((fid, ym, f"TREINAMENTOS: {e}"))
 
 if not all_months:
     st.error("Não consegui ler nenhuma BASE GERAL dos meses (verifique links e permissões).")
     with st.expander("Erros"):
         for fid, ym, e in err_msgs:
-            st.write(f"{ym} — {fid}")
-            st.exception(e)
+            st.write(f"{ym} — {fid} — {e}")
     st.stop()
 
 df = pd.concat(all_months, ignore_index=True)
@@ -475,16 +555,14 @@ df = pd.concat(all_months, ignore_index=True)
 # gerente final (coluna padronizada)
 df["GERENTE"] = df.apply(lambda r: infer_gerente(r.get("CIDADE", ""), r.get("SUPERVISOR", "")), axis=1)
 
-# garante FUNCAO_PAD
-if "FUNCAO_PAD" not in df.columns:
-    df["FUNCAO_PAD"] = df["FUNCAO"].astype(str).apply(normalize_role)
-
 ym_all = sorted(df["YM"].dropna().unique().tolist())
 if not ym_all:
     st.error("Não encontrei meses válidos para o filtro.")
     st.stop()
 
-df_train_all = pd.concat(all_train, ignore_index=True) if len(all_train) else pd.DataFrame(columns=["YM"])
+df_train = pd.concat(all_train, ignore_index=True) if all_train else pd.DataFrame(columns=[
+    "YM","SRC_FILE","CIDADE","NOME","NOME_KEY","CONVOCADO","PRESENCA_RAW","PRESENCA_BOOL","TREINAMENTO_NOME","AREA_SETOR"
+])
 
 
 # ------------------ UI MÊS ------------------
@@ -508,14 +586,13 @@ drange = st.date_input(
     format="DD/MM/YYYY",
 )
 start_d, end_d = (drange if isinstance(drange, tuple) and len(drange) == 2 else (month_start, month_end))
-
 start_ts = pd.Timestamp(start_d).normalize()
 end_ts = pd.Timestamp(end_d).normalize()
 
 
 # ------------------ FILTROS ------------------
 cidades = sorted(df_m["CIDADE"].dropna().unique().tolist())
-funcoes = sorted(df_m["FUNCAO_PAD"].dropna().unique().tolist())
+funcoes = sorted(df_m["FUNCAO"].dropna().unique().tolist())
 status_opts = sorted(df_m["STATUS"].dropna().unique().tolist())
 gerentes = sorted(df_m["GERENTE"].dropna().unique().tolist())
 
@@ -523,7 +600,7 @@ f1, f2, f3, f4 = st.columns(4)
 with f1:
     f_cidade = st.multiselect("Cidade", cidades, default=cidades)
 with f2:
-    f_funcao = st.multiselect("Função (padronizada)", funcoes, default=funcoes)
+    f_funcao = st.multiselect("Função", funcoes, default=funcoes)
 with f3:
     f_status = st.multiselect("Status", status_opts, default=status_opts)
 with f4:
@@ -531,9 +608,9 @@ with f4:
 
 view = df_m.copy()
 if f_cidade:
-    view = view[view["CIDADE"].isin([_upper(x) for x in f_cidade])]
+    view = view[view["CIDADE"].isin([normalize_cidade(x) for x in f_cidade])]
 if f_funcao:
-    view = view[view["FUNCAO_PAD"].isin([_upper(x) for x in f_funcao])]
+    view = view[view["FUNCAO"].isin([normalize_funcao(x) for x in f_funcao])]
 if f_status:
     view = view[view["STATUS"].isin([_upper(x) for x in f_status])]
 if f_gerente:
@@ -616,7 +693,7 @@ dias_uteis_mes = int(du_mes.mode().iloc[0]) if len(du_mes) else business_days_co
 faltas_total_mes = int(pd.to_numeric(view["FALTAS_MES"], errors="coerce").fillna(0).sum())
 abs_pct = abs_rate(faltas_total_mes, hc_end, dias_uteis_mes)
 
-pend_cadastro = int((view["ADMISSAO"].isna() | (view["FUNCAO_PAD"].astype(str).str.strip() == "")).sum())
+pend_cadastro = int((view["ADMISSAO"].isna() | (view["FUNCAO"].astype(str).str.strip() == "")).sum())
 
 ativo_count = int((view["STATUS"] == "ATIVO").sum()) if "STATUS" in view.columns else 0
 deslig_count = int((view["STATUS"] == "DESLIGADO").sum()) if "STATUS" in view.columns else 0
@@ -649,10 +726,9 @@ with tab_over:
 
     tmp = view.copy()
     tmp["ATIVO_FIM"] = tmp.apply(lambda r: 1 if is_active_asof(r, end_d) else 0, axis=1)
-
-    by_func = tmp.groupby("FUNCAO_PAD")["ATIVO_FIM"].sum().reset_index(name="QTD").sort_values("QTD", ascending=False)
+    by_func = tmp.groupby("FUNCAO")["ATIVO_FIM"].sum().reset_index(name="QTD").sort_values("QTD", ascending=False)
     with c1:
-        st.altair_chart(bar(by_func, "FUNCAO_PAD", "QTD", height=340, title="Headcount por função (padronizada)"), use_container_width=True)
+        st.altair_chart(bar(by_func, "FUNCAO", "QTD", height=340, title="Headcount por função (fim do período)"), use_container_width=True)
 
     by_city = tmp.groupby("CIDADE")["ATIVO_FIM"].sum().reset_index(name="QTD").sort_values("QTD", ascending=False)
     with c2:
@@ -662,21 +738,21 @@ with tab_over:
         st.markdown("<div class='section'>Movimentações (período)</div>", unsafe_allow_html=True)
         m1, m2 = st.columns(2)
 
-        a = adm_period.groupby("FUNCAO_PAD")["NOME"].size().reset_index(name="ADM")
-        d = dem_period.groupby("FUNCAO_PAD")["NOME"].size().reset_index(name="DEM")
-        md = a.merge(d, on="FUNCAO_PAD", how="outer").fillna(0)
+        a = adm_period.groupby("FUNCAO")["NOME"].size().reset_index(name="ADM")
+        d = dem_period.groupby("FUNCAO")["NOME"].size().reset_index(name="DEM")
+        md = a.merge(d, on="FUNCAO", how="outer").fillna(0)
         md["ADM"] = md["ADM"].astype(int)
         md["DEM"] = md["DEM"].astype(int)
 
         with m1:
             if len(md):
-                md_long = md.melt(id_vars=["FUNCAO_PAD"], value_vars=["ADM", "DEM"], var_name="TIPO", value_name="QTD")
+                md_long = md.melt(id_vars=["FUNCAO"], value_vars=["ADM", "DEM"], var_name="TIPO", value_name="QTD")
                 chart = alt.Chart(md_long).mark_bar().encode(
-                    x=alt.X("FUNCAO_PAD:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=220), title=""),
+                    x=alt.X("FUNCAO:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=220), title=""),
                     y=alt.Y("QTD:Q", title=""),
                     color=alt.Color("TIPO:N", legend=alt.Legend(title="")),
-                    tooltip=["FUNCAO_PAD", "TIPO", "QTD"],
-                ).properties(height=340, title="Admissões x Demissões por função (padronizada)")
+                    tooltip=["FUNCAO", "TIPO", "QTD"],
+                ).properties(height=340, title="Admissões x Demissões por função")
                 st.altair_chart(chart, use_container_width=True)
             else:
                 st.info("Sem admissões/demissões no período.")
@@ -743,12 +819,12 @@ with tab_people:
 
     st.markdown("<div class='section'>Distribuição (ativos no fim)</div>", unsafe_allow_html=True)
     c3, c4 = st.columns(2)
-    by_city = ppl.groupby("CIDADE")["NOME"].size().reset_index(name="QTD").sort_values("QTD", ascending=False)
-    by_func = ppl.groupby("FUNCAO_PAD")["NOME"].size().reset_index(name="QTD").sort_values("QTD", ascending=False)
+    by_city2 = ppl.groupby("CIDADE")["NOME"].size().reset_index(name="QTD").sort_values("QTD", ascending=False)
+    by_func2 = ppl.groupby("FUNCAO")["NOME"].size().reset_index(name="QTD").sort_values("QTD", ascending=False)
     with c3:
-        st.altair_chart(bar(by_city, "CIDADE", "QTD", height=340, title="Ativos por cidade"), use_container_width=True)
+        st.altair_chart(bar(by_city2, "CIDADE", "QTD", height=340, title="Ativos por cidade"), use_container_width=True)
     with c4:
-        st.altair_chart(bar(by_func, "FUNCAO_PAD", "QTD", height=340, title="Ativos por função (padronizada)"), use_container_width=True)
+        st.altair_chart(bar(by_func2, "FUNCAO", "QTD", height=340, title="Ativos por função"), use_container_width=True)
 
 
 # ============================================================
@@ -775,10 +851,8 @@ with tab_gest:
     mov_g["DEM"] = mov_g["DEM"].astype(int)
 
     falt_g = gdf.groupby("GERENTE")["FALTAS_MES"].sum().reset_index(name="FALTAS")
-    du_mode = dias_uteis_mes
-
     abs_g = hc_g.merge(falt_g, on="GERENTE", how="left").fillna(0)
-    abs_g["ABS_%"] = abs_g.apply(lambda r: abs_rate(int(r["FALTAS"]), int(r["HC_FIM"]), du_mode), axis=1)
+    abs_g["ABS_%"] = abs_g.apply(lambda r: abs_rate(int(r["FALTAS"]), int(r["HC_FIM"]), dias_uteis_mes), axis=1)
 
     gdf["ATIVO_INI"] = gdf.apply(lambda r: 1 if is_active_asof(r, start_d) else 0, axis=1)
     hc_ini = gdf.groupby("GERENTE")["ATIVO_INI"].sum().reset_index(name="HC_INI")
@@ -790,9 +864,9 @@ with tab_gest:
     with c1:
         st.altair_chart(bar(hc_g, "GERENTE", "HC_FIM", height=320, title="Headcount por gerente (fim)"), use_container_width=True)
     with c2:
-        tmp = mov_g.copy()
-        if len(tmp):
-            tmp_long = tmp.melt(id_vars=["GERENTE"], value_vars=["ADM", "DEM"], var_name="TIPO", value_name="QTD")
+        tmp2 = mov_g.copy()
+        if len(tmp2):
+            tmp_long = tmp2.melt(id_vars=["GERENTE"], value_vars=["ADM", "DEM"], var_name="TIPO", value_name="QTD")
             chart = alt.Chart(tmp_long).mark_bar().encode(
                 x=alt.X("GERENTE:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=260), title=""),
                 y=alt.Y("QTD:Q", title=""),
@@ -858,13 +932,13 @@ with tab_abs:
         chart = alt.Chart(top).mark_bar().encode(
             x=alt.X("NOME:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=260), title=""),
             y=alt.Y("FALTAS_MES:Q", title=""),
-            tooltip=["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "FALTAS_MES"],
+            tooltip=["NOME", "CIDADE", "FUNCAO", "GERENTE", "FALTAS_MES"],
         ).properties(height=340, title="Top 15 faltas por colaborador (mês)")
         st.altair_chart(chart, use_container_width=True)
 
     st.markdown("<div class='section'>Reincidência (comparando meses)</div>", unsafe_allow_html=True)
     hist = df.copy()
-    hist["KEY"] = hist.apply(lambda r: key_person(r.get("CPF", ""), r.get("NOME", "")), axis=1)
+    hist["KEY"] = (hist["CPF"].replace({"": np.nan}) + "|" + hist["NOME"].astype(str)).fillna(hist["NOME"].astype(str))
     hist["FALTAS_MES"] = pd.to_numeric(hist["FALTAS_MES"], errors="coerce").fillna(0).astype(int)
     rec = (
         hist.groupby(["KEY"])["FALTAS_MES"]
@@ -958,132 +1032,116 @@ with tab_turn:
 # TREINAMENTOS
 # ============================================================
 with tab_train:
-    st.markdown("<div class='section'>Treinamentos (mês / período)</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section'>Treinamentos (mês)</div>", unsafe_allow_html=True)
 
-    if df_train_all is None or df_train_all.empty:
-        st.warning("Sem base de treinamentos encontrada nas planilhas mensais (aba TREINAMENTOS).")
-        st.stop()
+    # pega treinamentos do mês selecionado
+    tr_m = df_train[df_train["YM"] == ym_sel].copy() if not df_train.empty else pd.DataFrame()
 
-    tr_m = df_train_all[df_train_all["YM"] == ym_sel].copy()
     if tr_m.empty:
-        st.warning("Este mês não tem registros na aba TREINAMENTOS (ou a aba não existe na base do mês).")
-        st.stop()
-
-    # filtro por período (se DATA estiver preenchida)
-    if "DATA" in tr_m.columns:
-        tr_m = tr_m[(tr_m["DATA"].isna()) | ((tr_m["DATA"] >= start_ts) & (tr_m["DATA"] <= end_ts))].copy()
-
-    # Cria KEY do treinamento
-    tr_m["KEY"] = tr_m.apply(lambda r: key_person(r.get("CPF", ""), r.get("NOME", "")), axis=1)
-
-    # roster de ativos no fim do período no recorte atual
-    roster = view.copy()
-    roster["ATIVO_FIM"] = roster.apply(lambda r: 1 if is_active_asof(r, end_d) else 0, axis=1)
-    roster = roster[roster["ATIVO_FIM"] == 1].copy()
-    roster["KEY"] = roster.apply(lambda r: key_person(r.get("CPF", ""), r.get("NOME", "")), axis=1)
-
-    # Aplica filtros de cidade/gerente/função também nos treinos via roster
-    roster_keep = roster[["KEY", "NOME", "CPF", "CIDADE", "GERENTE", "FUNCAO_PAD"]].drop_duplicates("KEY")
-
-    # Enriquecer treinos com cidade/gerente/função pelo roster (quando bater)
-    tr_en = tr_m.merge(roster_keep, on="KEY", how="left", suffixes=("", "_RH"))
-
-    # Se treino tiver cidade, usa ela; senão usa a do RH
-    if "CIDADE" in tr_en.columns:
-        tr_en["CIDADE_FINAL"] = tr_en["CIDADE"].where(tr_en["CIDADE"].astype(str).str.strip() != "", tr_en["CIDADE_RH"])
+        st.warning("Sem base de treinamentos encontrada nas planilhas mensais (aba TREINAMENTOS).")
     else:
-        tr_en["CIDADE_FINAL"] = tr_en["CIDADE_RH"]
+        # Enriquecer treinamentos com FUNCAO/GERENTE/STATUS a partir da BASE (do mês)
+        base_map = df_m[["NOME_KEY", "CPF", "FUNCAO", "CIDADE", "GERENTE", "STATUS"]].drop_duplicates().copy()
+        tr_m = tr_m.merge(base_map, on="NOME_KEY", how="left", suffixes=("", "_BASE"))
 
-    # Gerente: inferir pela cidade final quando não tiver no RH
-    tr_en["GERENTE_FINAL"] = tr_en["GERENTE"].where(
-        tr_en["GERENTE"].astype(str).str.strip() != "",
-        tr_en["CIDADE_FINAL"].apply(lambda c: infer_gerente(c, "")),
-    )
+        # aplica os MESMOS filtros do topo (cidade/função/status/gerente) no DF de treinamentos
+        if f_cidade:
+            tr_m = tr_m[tr_m["CIDADE"].isin([normalize_cidade(x) for x in f_cidade])]
+        if f_funcao:
+            tr_m = tr_m[tr_m["FUNCAO"].isin([normalize_funcao(x) for x in f_funcao])]
+        if f_status:
+            tr_m = tr_m[tr_m["STATUS"].isin([_upper(x) for x in f_status])]
+        if f_gerente:
+            tr_m = tr_m[tr_m["GERENTE"].isin([_upper(x) for x in f_gerente])]
 
-    # Função: usa a do RH quando bater, senão vazio
-    tr_en["FUNCAO_PAD_FINAL"] = tr_en["FUNCAO_PAD"].fillna("").astype(str)
+        if tr_m.empty:
+            st.info("Sem registros de treinamento no recorte selecionado.")
+        else:
+            conv = tr_m["CONVOCADO"].apply(safe_int).sum()
+            pres = tr_m["PRESENCA_BOOL"].apply(lambda x: True if x is True else False).sum()
+            cobertura = np.nan if conv == 0 else (pres / conv) * 100
 
-    # Mantém só presenças
-    if "PRESENTE" in tr_en.columns:
-        tr_en = tr_en[tr_en["PRESENTE"] == 1].copy()
+            participantes = tr_m["NOME_KEY"].nunique()
+            trein_dist = tr_m["TREINAMENTO_NOME"].replace({"": np.nan, "nan": np.nan}).dropna().nunique()
 
-    # KPIs
-    treinos_realizados = int(tr_en["TREINAMENTO"].nunique()) if "TREINAMENTO" in tr_en.columns else 0
-    participacoes = int(len(tr_en))
-    participantes_unicos = int(tr_en["KEY"].nunique()) if "KEY" in tr_en.columns else 0
-    hc_ref = int(len(roster_keep))  # headcount ativo no fim (recorte)
-    cobertura = safe_div(participantes_unicos, hc_ref) * 100 if hc_ref else np.nan
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.metric("Convocados", int(conv))
+            with k2:
+                st.metric("Presenças", int(pres))
+            with k3:
+                st.metric("Cobertura", fmt_pct(cobertura))
+            with k4:
+                st.metric("Treinamentos (distintos)", int(trein_dist))
 
-    cards = f"""
-    <div class="card-wrap">
-      <div class='card'><h4>Treinamentos (no período)</h4><h2>{treinos_realizados:,}</h2></div>
-      <div class='card'><h4>Participações (presenças)</h4><h2>{participacoes:,}</h2></div>
-      <div class='card'><h4>Participantes únicos</h4><h2>{participantes_unicos:,}</h2></div>
-      <div class='card'><h4>Cobertura (ativos fim)</h4><h2>{fmt_pct(cobertura)}</h2><span class='sub neu'>base: {hc_ref:,} ativos</span></div>
-    </div>
-    """
-    st.markdown(cards.replace(",", "."), unsafe_allow_html=True)
+            if not fast_mode:
+                st.markdown("<div class='section'>Distribuições</div>", unsafe_allow_html=True)
+                c1, c2 = st.columns(2)
 
-    c1, c2 = st.columns(2)
+                by_city_t = (
+                    tr_m.groupby("CIDADE")
+                    .agg(CONV=("CONVOCADO", "sum"), PRES=("PRESENCA_BOOL", lambda s: int((s == True).sum())))
+                    .reset_index()
+                )
+                by_city_t["COB_%"] = by_city_t.apply(lambda r: np.nan if r["CONV"] == 0 else (r["PRES"] / r["CONV"]) * 100, axis=1)
 
-    # Cobertura por cidade
-    if len(tr_en):
-        # participantes únicos por cidade
-        part_city = tr_en.dropna(subset=["CIDADE_FINAL"]).groupby("CIDADE_FINAL")["KEY"].nunique().reset_index(name="PARTICIPANTES")
-        # HC por cidade (ativos no fim)
-        hc_city = roster_keep.groupby("CIDADE")["KEY"].nunique().reset_index(name="HC")
-        cov_city = hc_city.merge(part_city, left_on="CIDADE", right_on="CIDADE_FINAL", how="left").fillna(0)
-        cov_city["COB_%"] = cov_city.apply(lambda r: safe_div(int(r["PARTICIPANTES"]), int(r["HC"])) * 100 if int(r["HC"]) else np.nan, axis=1)
-        cov_city = cov_city.sort_values("COB_%", ascending=False)
+                with c1:
+                    plot = by_city_t.sort_values("COB_%", ascending=False).copy()
+                    chart = alt.Chart(plot).mark_bar().encode(
+                        x=alt.X("CIDADE:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=240), title=""),
+                        y=alt.Y("COB_%:Q", title=""),
+                        tooltip=["CIDADE", "CONV", "PRES", alt.Tooltip("COB_%:Q", format=".2f")],
+                    ).properties(height=320, title="Cobertura por cidade (%)")
+                    st.altair_chart(chart, use_container_width=True)
 
-        with c1:
-            st.altair_chart(bar(cov_city, "CIDADE", "COB_%", height=320, title="Cobertura por cidade (%)"), use_container_width=True)
+                by_func_t = (
+                    tr_m.groupby("FUNCAO")
+                    .agg(CONV=("CONVOCADO", "sum"), PRES=("PRESENCA_BOOL", lambda s: int((s == True).sum())))
+                    .reset_index()
+                )
+                by_func_t["COB_%"] = by_func_t.apply(lambda r: np.nan if r["CONV"] == 0 else (r["PRES"] / r["CONV"]) * 100, axis=1)
 
-        # Cobertura por gerente
-        part_g = tr_en.dropna(subset=["GERENTE_FINAL"]).groupby("GERENTE_FINAL")["KEY"].nunique().reset_index(name="PARTICIPANTES")
-        hc_g = roster_keep.groupby("GERENTE")["KEY"].nunique().reset_index(name="HC")
-        cov_g = hc_g.merge(part_g, left_on="GERENTE", right_on="GERENTE_FINAL", how="left").fillna(0)
-        cov_g["COB_%"] = cov_g.apply(lambda r: safe_div(int(r["PARTICIPANTES"]), int(r["HC"])) * 100 if int(r["HC"]) else np.nan, axis=1)
-        cov_g = cov_g.sort_values("COB_%", ascending=False)
+                with c2:
+                    plot = by_func_t.sort_values("COB_%", ascending=False).copy()
+                    chart = alt.Chart(plot).mark_bar().encode(
+                        x=alt.X("FUNCAO:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=240), title=""),
+                        y=alt.Y("COB_%:Q", title=""),
+                        tooltip=["FUNCAO", "CONV", "PRES", alt.Tooltip("COB_%:Q", format=".2f")],
+                    ).properties(height=320, title="Cobertura por função (%)")
+                    st.altair_chart(chart, use_container_width=True)
 
-        with c2:
-            st.altair_chart(bar(cov_g, "GERENTE", "COB_%", height=320, title="Cobertura por gerente (%)"), use_container_width=True)
+                # Top treinamentos por presença
+                st.markdown("<div class='section'>Top treinamentos (por presença)</div>", unsafe_allow_html=True)
+                tt = tr_m.copy()
+                tt["TREINAMENTO_NOME"] = tt["TREINAMENTO_NOME"].replace({"": np.nan, "nan": np.nan})
+                tt = tt.dropna(subset=["TREINAMENTO_NOME"])
+                if len(tt):
+                    top_t = (
+                        tt.groupby("TREINAMENTO_NOME")
+                        .agg(PRES=("PRESENCA_BOOL", lambda s: int((s == True).sum())),
+                             CONV=("CONVOCADO", "sum"))
+                        .reset_index()
+                    )
+                    top_t["PRES"] = pd.to_numeric(top_t["PRES"], errors="coerce").fillna(0).astype(int)
+                    top_t = top_t.sort_values("PRES", ascending=False).head(15)
 
-        st.markdown("<div class='section'>Detalhes</div>", unsafe_allow_html=True)
-        d1, d2 = st.columns(2)
+                    st.altair_chart(
+                        alt.Chart(top_t).mark_bar().encode(
+                            x=alt.X("TREINAMENTO_NOME:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=260), title=""),
+                            y=alt.Y("PRES:Q", title=""),
+                            tooltip=["TREINAMENTO_NOME", "PRES", "CONV"],
+                        ).properties(height=340),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("Sem nome de treinamento preenchido para montar ranking.")
 
-        # Participações por treinamento
-        by_tr = tr_en.groupby("TREINAMENTO")["KEY"].count().reset_index(name="PRESENÇAS").sort_values("PRESENÇAS", ascending=False).head(15)
-        with d1:
-            st.altair_chart(bar(by_tr, "TREINAMENTO", "PRESENÇAS", height=340, title="Top treinamentos por presenças"), use_container_width=True)
-
-        # Top participantes
-        by_p = tr_en.groupby("KEY")["TREINAMENTO"].count().reset_index(name="PRESENÇAS").sort_values("PRESENÇAS", ascending=False).head(20)
-        by_p = by_p.merge(roster_keep[["KEY", "NOME", "CIDADE", "GERENTE", "FUNCAO_PAD"]], on="KEY", how="left")
-        with d2:
-            st.dataframe(by_p.rename(columns={"FUNCAO_PAD":"FUNÇÃO"}), use_container_width=True, hide_index=True)
-
-        # Cobertura por função
-        st.markdown("<div class='section'>Cobertura por função (padronizada)</div>", unsafe_allow_html=True)
-        part_f = tr_en.dropna(subset=["FUNCAO_PAD_FINAL"]).groupby("FUNCAO_PAD_FINAL")["KEY"].nunique().reset_index(name="PARTICIPANTES")
-        hc_f = roster_keep.groupby("FUNCAO_PAD")["KEY"].nunique().reset_index(name="HC")
-        cov_f = hc_f.merge(part_f, left_on="FUNCAO_PAD", right_on="FUNCAO_PAD_FINAL", how="left").fillna(0)
-        cov_f["COB_%"] = cov_f.apply(lambda r: safe_div(int(r["PARTICIPANTES"]), int(r["HC"])) * 100 if int(r["HC"]) else np.nan, axis=1)
-        cov_f = cov_f.sort_values("COB_%", ascending=False)
-        st.altair_chart(bar(cov_f, "FUNCAO_PAD", "COB_%", height=320, title="Cobertura por função (%)"), use_container_width=True)
-
-        if not fast_mode:
-            st.markdown("<div class='section'>Base Treinamentos (recorte)</div>", unsafe_allow_html=True)
-            cols_tr = ["DATA", "TREINAMENTO", "NOME", "CPF", "CIDADE_FINAL", "GERENTE_FINAL", "FUNCAO_PAD_FINAL"]
-            for c in cols_tr:
-                if c not in tr_en.columns:
-                    tr_en[c] = ""
-            tr_show = tr_en[cols_tr].copy()
-            tr_show["DATA"] = pd.to_datetime(tr_show["DATA"], errors="coerce").dt.strftime("%d/%m/%Y")
-            tr_show = tr_show.rename(columns={"CIDADE_FINAL":"CIDADE", "GERENTE_FINAL":"GERENTE", "FUNCAO_PAD_FINAL":"FUNÇÃO"})
-            st.dataframe(tr_show, use_container_width=True, hide_index=True)
-    else:
-        st.info("Sem presenças no período selecionado (ou status marcado como ausente).")
+            st.markdown("<div class='section'>Base de treinamentos (recorte)</div>", unsafe_allow_html=True)
+            show_cols = ["CIDADE","NOME","FUNCAO","GERENTE","STATUS","CONVOCADO","PRESENCA_RAW","TREINAMENTO_NOME","AREA_SETOR","SRC_FILE"]
+            for c in show_cols:
+                if c not in tr_m.columns:
+                    tr_m[c] = ""
+            st.dataframe(tr_m[show_cols], use_container_width=True, hide_index=True)
 
 
 # ============================================================
@@ -1093,8 +1151,7 @@ with tab_base:
     st.markdown("<div class='section'>Base (recorte atual)</div>", unsafe_allow_html=True)
 
     cols_show = [
-        "YM", "CIDADE", "GERENTE", "NOME", "CPF",
-        "FUNCAO", "FUNCAO_PAD",
+        "YM", "CIDADE", "GERENTE", "NOME", "CPF", "FUNCAO",
         "ADMISSAO", "DEMISSAO", "MOTIVO_DEMISSAO", "STATUS",
         "FALTAS_MES", "DIAS_UTEIS_MES", "SUPERVISOR", "SRC_FILE"
     ]
@@ -1139,6 +1196,12 @@ with tab_base:
             )
             resumo.to_excel(writer, index=False, sheet_name="RESUMO")
 
+            # Treinamentos (se existir)
+            if not df_train.empty:
+                tr_export = df_train[df_train["YM"] == ym_sel].copy()
+                if not tr_export.empty:
+                    tr_export.to_excel(writer, index=False, sheet_name="TREINAMENTOS_MES")
+
         xbuf.seek(0)
         st.download_button(
             "Baixar Excel (recorte + resumo)",
@@ -1158,10 +1221,9 @@ with tab_base:
         if err_msgs:
             st.write("Falhas:")
             for fid, ym, e in err_msgs:
-                st.write(f"{ym} — {fid}")
-                st.exception(e)
+                st.write(f"{ym} — {fid} — {e}")
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.caption(
-        "Obs.: Heatmap diário depende de base com granularidade por dia. Treinamentos depende da aba TREINAMENTOS em cada mês."
+        "Obs.: Heatmap diário depende de uma base com granularidade por dia. Treinamentos usa a aba TREINAMENTOS quando disponível."
     )
