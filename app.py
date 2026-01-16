@@ -147,12 +147,6 @@ def parse_month_to_ym(m: str) -> Optional[str]:
         return None
 
 def to_ts(x) -> pd.Timestamp:
-    """
-    Conversão robusta de data:
-    - Excel serial
-    - datetime/date
-    - texto BR (dd/mm/yyyy) sempre com dayfirst=True quando tiver "/"
-    """
     if x is None or (isinstance(x, str) and not x.strip()):
         return pd.NaT
     if pd.isna(x):
@@ -169,15 +163,11 @@ def to_ts(x) -> pd.Timestamp:
             return (base + pd.to_timedelta(int(x), unit="D")).normalize()
 
         s = str(x).strip()
+        # padrão BR quando vier tipo 01/12/2025
+        if re.match(r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$", s):
+            return pd.to_datetime(s, errors="coerce", dayfirst=True).normalize()
 
-        # força BR quando houver "/"
-        if "/" in s:
-            dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-            return dt.normalize() if not pd.isna(dt) else pd.NaT
-
-        # fallback
-        dt = pd.to_datetime(s, errors="coerce")
-        return dt.normalize() if not pd.isna(dt) else pd.NaT
+        return pd.to_datetime(s, errors="coerce").normalize()
     except Exception:
         return pd.NaT
 
@@ -268,7 +258,6 @@ def _table_from_excel_like(df_raw: pd.DataFrame, must_have=("CIDADE", "NOME")) -
     hr = _detect_header_row(df_raw, must_have=must_have)
     if hr is None:
         return df_raw
-
     header = df_raw.iloc[hr].astype(str).tolist()
     df = df_raw.iloc[hr + 1 :].copy()
     df.columns = [str(h).strip() for h in header]
@@ -622,7 +611,8 @@ adm_period = view[(view["ADMISSAO"].notna()) & (view["ADMISSAO"] >= start_ts) & 
 dem_period = view[(view["DEMISSAO"].notna()) & (view["DEMISSAO"] >= start_ts) & (view["DEMISSAO"] <= end_ts)]
 
 n_adm = int(len(adm_period))
-n_dem_period = int(len(dem_period))
+n_dem_period = int(len(dem_period))  # <- demissões "por período" (datas)
+
 turnover = turnover_pct(n_adm, n_dem_period, hc_start, hc_end)
 
 du_mes = pd.to_numeric(view["DIAS_UTEIS_MES"], errors="coerce").dropna()
@@ -633,15 +623,16 @@ abs_pct = abs_rate(faltas_total_mes, hc_end, dias_uteis_mes)
 
 pend_cadastro = int((view["ADMISSAO"].isna() | (view["FUNCAO_PAD"].astype(str).str.strip() == "")).sum())
 
+# CONTAGEM POR STATUS (o que você pediu)
 ativo_count = int((view["STATUS"] == "ATIVO").sum()) if "STATUS" in view.columns else 0
-deslig_count = int((view["STATUS"] == "DESLIGADO").sum()) if "STATUS" in view.columns else 0
+deslig_count = int((view["STATUS"] == "DESLIGADO").sum()) if "STATUS" in view.columns else 0  # <- usado no card
 
 cards_html = f"""
 <div class="card-wrap">
   <div class='card'><h4>Headcount (fim)</h4><h2>{hc_end:,}</h2><span class='sub neu'>início: {hc_start:,} | médio: {hc_avg:.1f}</span></div>
   <div class='card'><h4>Ativos x Desligados</h4><h2>{ativo_count:,} / {deslig_count:,}</h2><span class='sub neu'>status do mês</span></div>
   <div class='card'><h4>Admissões</h4><h2>{n_adm:,}</h2><span class='sub neu'>no período</span></div>
-  <div class='card'><h4>Demissões</h4><h2>{n_dem_period:,}</h2><span class='sub neu'>no período</span></div>
+  <div class='card'><h4>Desligados</h4><h2>{deslig_count:,}</h2><span class='sub neu'>no período: {n_dem_period:,}</span></div>
   <div class='card'><h4>Turnover</h4><h2>{fmt_pct(turnover)}</h2><span class='sub neu'>((adm+dem)/2)/HC médio</span></div>
   <div class='card'><h4>Absenteísmo</h4><h2>{fmt_pct(abs_pct)}</h2><span class='sub neu'>faltas: {faltas_total_mes:,} | DU: {dias_uteis_mes}</span></div>
   <div class='card'><h4>Pendências cadastro</h4><h2>{pend_cadastro:,}</h2></div>
@@ -897,14 +888,14 @@ with tab_turn:
         y, m = int(ym[:4]), int(ym[5:7])
         ms = date(y, m, 1)
         me = date(y, m, calendar.monthrange(y, m)[1])
-        st_ts = pd.Timestamp(ms).normalize()
-        en_ts = pd.Timestamp(me).normalize()
+        st_ts2 = pd.Timestamp(ms).normalize()
+        en_ts2 = pd.Timestamp(me).normalize()
 
         hc_s = count_active_asof(df_ym, ms)
         hc_e = count_active_asof(df_ym, me)
 
-        adm = df_ym[(df_ym["ADMISSAO"].notna()) & (df_ym["ADMISSAO"] >= st_ts) & (df_ym["ADMISSAO"] <= en_ts)]
-        dem = df_ym[(df_ym["DEMISSAO"].notna()) & (df_ym["DEMISSAO"] >= st_ts) & (df_ym["DEMISSAO"] <= en_ts)]
+        adm = df_ym[(df_ym["ADMISSAO"].notna()) & (df_ym["ADMISSAO"] >= st_ts2) & (df_ym["ADMISSAO"] <= en_ts2)]
+        dem = df_ym[(df_ym["DEMISSAO"].notna()) & (df_ym["DEMISSAO"] >= st_ts2) & (df_ym["DEMISSAO"] <= en_ts2)]
 
         t = turnover_pct(int(len(adm)), int(len(dem)), hc_s, hc_e)
 
@@ -935,33 +926,35 @@ with tab_turn:
             ).properties(height=300, title="Entradas x Saídas mês a mês")
             st.altair_chart(chart, use_container_width=True)
 
-    # --- NOVO: lista de nomes admitidos/demitidos no período selecionado (mês) ---
-    st.markdown("<div class='section'>Nomes do período (mês selecionado)</div>", unsafe_allow_html=True)
-
+    # NOVO: LISTA NOMINAL (admitidos / desligados no período do mês selecionado)
+    st.markdown("<div class='section'>Quem entrou e quem saiu (mês selecionado / período)</div>", unsafe_allow_html=True)
     colA, colB = st.columns(2)
+
+    adm_list = adm_period.copy()
+    if len(adm_list):
+        adm_list = adm_list[["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "ADMISSAO"]].copy()
+        adm_list["ADMISSAO"] = pd.to_datetime(adm_list["ADMISSAO"], errors="coerce").dt.strftime("%d/%m/%Y")
+        adm_list = adm_list.sort_values(["CIDADE", "NOME"])
+    dem_list = dem_period.copy()
+    if len(dem_list):
+        dem_list = dem_list[["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "DEMISSAO", "MOTIVO_DEMISSAO"]].copy()
+        dem_list["DEMISSAO"] = pd.to_datetime(dem_list["DEMISSAO"], errors="coerce").dt.strftime("%d/%m/%Y")
+        dem_list = dem_list.sort_values(["CIDADE", "NOME"])
 
     with colA:
         st.markdown("**Admitidos (no período)**")
-        adm_list = adm_period.copy()
         if len(adm_list):
-            adm_show = adm_list[["ADMISSAO", "NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "STATUS", "SRC_FILE"]].copy()
-            adm_show["ADMISSAO"] = pd.to_datetime(adm_show["ADMISSAO"], errors="coerce").dt.strftime("%d/%m/%Y")
-            adm_show = adm_show.sort_values(["ADMISSAO", "NOME"])
-            st.dataframe(adm_show, use_container_width=True, hide_index=True)
+            st.dataframe(adm_list, use_container_width=True, hide_index=True)
         else:
             st.info("Sem admissões no período selecionado.")
-
     with colB:
         st.markdown("**Desligados (no período)**")
-        dem_list = dem_period.copy()
         if len(dem_list):
-            dem_show = dem_list[["DEMISSAO", "NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "MOTIVO_DEMISSAO", "STATUS", "SRC_FILE"]].copy()
-            dem_show["DEMISSAO"] = pd.to_datetime(dem_show["DEMISSAO"], errors="coerce").dt.strftime("%d/%m/%Y")
-            dem_show = dem_show.sort_values(["DEMISSAO", "NOME"])
-            st.dataframe(dem_show, use_container_width=True, hide_index=True)
+            st.dataframe(dem_list, use_container_width=True, hide_index=True)
         else:
-            st.info("Sem demissões no período selecionado.")
+            st.info("Sem desligamentos no período selecionado.")
 
+    # TURNOVER POR CIDADE (como abs por cidade)
     st.markdown("<div class='section'>Turnover por cidade (mês selecionado / período)</div>", unsafe_allow_html=True)
 
     city_rows = []
@@ -988,7 +981,7 @@ with tab_turn:
     else:
         st.info("Sem dados suficientes para calcular turnover por cidade no recorte.")
 
-    st.markdown("<div class='section'>Motivos de desligamento (mês selecionado)</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section'>Motivos de desligamento (mês selecionado / período)</div>", unsafe_allow_html=True)
     dem_sel = dem_period.copy()
     dem_sel["MOTIVO_DEMISSAO"] = dem_sel["MOTIVO_DEMISSAO"].astype(str).str.strip()
     by_mot = dem_sel.groupby("MOTIVO_DEMISSAO")["NOME"].size().reset_index(name="QTD").sort_values("QTD", ascending=False)
