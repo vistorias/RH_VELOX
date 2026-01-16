@@ -161,7 +161,13 @@ def to_ts(x) -> pd.Timestamp:
         if isinstance(x, (int, float)) and not isinstance(x, bool):
             base = pd.Timestamp("1899-12-30")
             return (base + pd.to_timedelta(int(x), unit="D")).normalize()
-        return pd.to_datetime(x, errors="coerce").normalize()
+
+        s = str(x).strip()
+        # padrão BR quando vier tipo 01/12/2025
+        if re.match(r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$", s):
+            return pd.to_datetime(s, errors="coerce", dayfirst=True).normalize()
+
+        return pd.to_datetime(s, errors="coerce").normalize()
     except Exception:
         return pd.NaT
 
