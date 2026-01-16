@@ -147,6 +147,12 @@ def parse_month_to_ym(m: str) -> Optional[str]:
         return None
 
 def to_ts(x) -> pd.Timestamp:
+    """
+    Conversão robusta de data:
+    - Excel serial
+    - datetime/date
+    - texto BR (dd/mm/yyyy) sempre com dayfirst=True quando tiver "/"
+    """
     if x is None or (isinstance(x, str) and not x.strip()):
         return pd.NaT
     if pd.isna(x):
@@ -163,11 +169,15 @@ def to_ts(x) -> pd.Timestamp:
             return (base + pd.to_timedelta(int(x), unit="D")).normalize()
 
         s = str(x).strip()
-        # padrão BR quando vier tipo 01/12/2025
-        if re.match(r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$", s):
-            return pd.to_datetime(s, errors="coerce", dayfirst=True).normalize()
 
-        return pd.to_datetime(s, errors="coerce").normalize()
+        # força BR quando houver "/"
+        if "/" in s:
+            dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+            return dt.normalize() if not pd.isna(dt) else pd.NaT
+
+        # fallback
+        dt = pd.to_datetime(s, errors="coerce")
+        return dt.normalize() if not pd.isna(dt) else pd.NaT
     except Exception:
         return pd.NaT
 
@@ -242,7 +252,6 @@ def _normalize_cols(df_in: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _detect_header_row(df_raw: pd.DataFrame, must_have=("CIDADE", "NOME")) -> Optional[int]:
-    # procura nas primeiras 15 linhas uma linha que contenha os cabeçalhos
     max_scan = min(15, len(df_raw))
     for i in range(max_scan):
         row = df_raw.iloc[i].astype(str).map(lambda x: _upper(_strip_accents(x)))
@@ -349,7 +358,6 @@ def read_training_month(file_id: str, ym_from_index: str) -> pd.DataFrame:
 
     if mime == "application/vnd.google-apps.spreadsheet":
         sh = client.open_by_key(file_id)
-        # tenta aba TREINAMENTOS, se não existir tenta TREINAMENTO
         titles = [w.title for w in sh.worksheets()]
         target = None
         for t in ["TREINAMENTOS", "TREINAMENTO"]:
@@ -367,7 +375,6 @@ def read_training_month(file_id: str, ym_from_index: str) -> pd.DataFrame:
         df = _table_from_excel_like(df_raw, must_have=("CIDADE", "NOME"))
     else:
         content = _drive_download_bytes(file_id)
-        # tenta aba TREINAMENTOS, se não existir tenta TREINAMENTO
         try:
             df_raw = pd.read_excel(io.BytesIO(content), sheet_name="TREINAMENTOS", engine="openpyxl")
         except Exception:
@@ -404,7 +411,6 @@ def read_training_month(file_id: str, ym_from_index: str) -> pd.DataFrame:
 
     out = out[out["NOME"].astype(str).str.strip() != ""].copy()
 
-    # flags
     out["IS_CONVOCADO"] = out["CONVOCADO"].map(lambda v: str(v).strip().upper() in {"1", "S", "SIM", "TRUE", "Y", "YES"})
     out["IS_PRESENTE"] = out["PRESENCA"].map(lambda v: str(v).strip().upper() in {"1", "S", "SIM", "TRUE", "Y", "YES"})
 
@@ -465,7 +471,6 @@ for _, r in idx.iterrows():
             all_months.append(d)
         ok_msgs.append(f"{ym} — {ttl} ({len(d)} linhas)")
 
-        # treinamentos (não quebra se não existir)
         try:
             tdf = read_training_month(fid, ym_from_index=ym)
             if tdf is not None and not tdf.empty:
@@ -491,7 +496,6 @@ df_train = pd.concat(all_train, ignore_index=True) if all_train else pd.DataFram
 if not df_train.empty:
     df_train["GERENTE"] = df_train["CIDADE"].apply(lambda c: infer_gerente(c, ""))
 
-
 ym_all = sorted(df["YM"].dropna().unique().tolist())
 if not ym_all:
     st.error("Não encontrei meses válidos para o filtro.")
@@ -506,7 +510,6 @@ ym_sel = label_map[sel_label]
 ref_year, ref_month = int(ym_sel[:4]), int(ym_sel[5:7])
 df_m = df[df["YM"] == ym_sel].copy()
 
-# período no mês
 month_start = date(ref_year, ref_month, 1)
 last_day = calendar.monthrange(ref_year, ref_month)[1]
 month_end = date(ref_year, ref_month, last_day)
@@ -525,7 +528,7 @@ end_ts = pd.Timestamp(end_d).normalize()
 
 # ------------------ FILTROS ------------------
 cidades = sorted(df_m["CIDADE"].dropna().unique().tolist())
-funcoes = sorted(df_m["FUNCAO_PAD"].dropna().unique().tolist())  # usa padronizada
+funcoes = sorted(df_m["FUNCAO_PAD"].dropna().unique().tolist())
 status_opts = sorted(df_m["STATUS"].dropna().unique().tolist())
 gerentes = sorted(df_m["GERENTE"].dropna().unique().tolist())
 
@@ -619,8 +622,8 @@ adm_period = view[(view["ADMISSAO"].notna()) & (view["ADMISSAO"] >= start_ts) & 
 dem_period = view[(view["DEMISSAO"].notna()) & (view["DEMISSAO"] >= start_ts) & (view["DEMISSAO"] <= end_ts)]
 
 n_adm = int(len(adm_period))
-n_dem = int(len(dem_period))
-turnover = turnover_pct(n_adm, n_dem, hc_start, hc_end)
+n_dem_period = int(len(dem_period))
+turnover = turnover_pct(n_adm, n_dem_period, hc_start, hc_end)
 
 du_mes = pd.to_numeric(view["DIAS_UTEIS_MES"], errors="coerce").dropna()
 dias_uteis_mes = int(du_mes.mode().iloc[0]) if len(du_mes) else business_days_count(month_start, month_end)
@@ -637,8 +640,8 @@ cards_html = f"""
 <div class="card-wrap">
   <div class='card'><h4>Headcount (fim)</h4><h2>{hc_end:,}</h2><span class='sub neu'>início: {hc_start:,} | médio: {hc_avg:.1f}</span></div>
   <div class='card'><h4>Ativos x Desligados</h4><h2>{ativo_count:,} / {deslig_count:,}</h2><span class='sub neu'>status do mês</span></div>
-  <div class='card'><h4>Admissões</h4><h2>{n_adm:,}</h2></div>
-  <div class='card'><h4>Demissões</h4><h2>{n_dem:,}</h2></div>
+  <div class='card'><h4>Admissões</h4><h2>{n_adm:,}</h2><span class='sub neu'>no período</span></div>
+  <div class='card'><h4>Demissões</h4><h2>{n_dem_period:,}</h2><span class='sub neu'>no período</span></div>
   <div class='card'><h4>Turnover</h4><h2>{fmt_pct(turnover)}</h2><span class='sub neu'>((adm+dem)/2)/HC médio</span></div>
   <div class='card'><h4>Absenteísmo</h4><h2>{fmt_pct(abs_pct)}</h2><span class='sub neu'>faltas: {faltas_total_mes:,} | DU: {dias_uteis_mes}</span></div>
   <div class='card'><h4>Pendências cadastro</h4><h2>{pend_cadastro:,}</h2></div>
@@ -932,9 +935,35 @@ with tab_turn:
             ).properties(height=300, title="Entradas x Saídas mês a mês")
             st.altair_chart(chart, use_container_width=True)
 
+    # --- NOVO: lista de nomes admitidos/demitidos no período selecionado (mês) ---
+    st.markdown("<div class='section'>Nomes do período (mês selecionado)</div>", unsafe_allow_html=True)
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown("**Admitidos (no período)**")
+        adm_list = adm_period.copy()
+        if len(adm_list):
+            adm_show = adm_list[["ADMISSAO", "NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "STATUS", "SRC_FILE"]].copy()
+            adm_show["ADMISSAO"] = pd.to_datetime(adm_show["ADMISSAO"], errors="coerce").dt.strftime("%d/%m/%Y")
+            adm_show = adm_show.sort_values(["ADMISSAO", "NOME"])
+            st.dataframe(adm_show, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem admissões no período selecionado.")
+
+    with colB:
+        st.markdown("**Desligados (no período)**")
+        dem_list = dem_period.copy()
+        if len(dem_list):
+            dem_show = dem_list[["DEMISSAO", "NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "MOTIVO_DEMISSAO", "STATUS", "SRC_FILE"]].copy()
+            dem_show["DEMISSAO"] = pd.to_datetime(dem_show["DEMISSAO"], errors="coerce").dt.strftime("%d/%m/%Y")
+            dem_show = dem_show.sort_values(["DEMISSAO", "NOME"])
+            st.dataframe(dem_show, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sem demissões no período selecionado.")
+
     st.markdown("<div class='section'>Turnover por cidade (mês selecionado / período)</div>", unsafe_allow_html=True)
 
-    # turnover por cidade no mês selecionado e período selecionado
     city_rows = []
     for city in sorted(view["CIDADE"].dropna().unique().tolist()):
         sub = view[view["CIDADE"] == city].copy()
@@ -1000,7 +1029,6 @@ with tab_train:
             with c3:
                 st.metric("Cobertura (%)", f"{cobertura:.1f}%".replace(".", ","))
 
-            # cobertura por cidade
             st.markdown("<div class='section'>Cobertura</div>", unsafe_allow_html=True)
 
             by_city = (
@@ -1023,13 +1051,11 @@ with tab_train:
 
             colA, colB = st.columns(2)
             with colA:
-                # COM RÓTULO (pedido)
                 st.altair_chart(
                     bar_with_labels(by_city, "CIDADE", "COB_%", height=320, title="Cobertura de treinamento por cidade (%)", y_format=".1f"),
                     use_container_width=True,
                 )
             with colB:
-                # COM RÓTULO (pedido)
                 st.altair_chart(
                     bar_with_labels(by_g, "GERENTE", "COB_%", height=320, title="Cobertura de treinamento por gerente (%)", y_format=".1f"),
                     use_container_width=True,
@@ -1064,7 +1090,6 @@ with tab_base:
 
     st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-    # Export Excel
     try:
         import openpyxl  # noqa
 
@@ -1078,14 +1103,14 @@ with tab_base:
                         "Mês referência", "Período início", "Período fim",
                         "HC fim", "HC início", "HC médio",
                         "Ativos (status)", "Desligados (status)",
-                        "Admissões", "Demissões",
+                        "Admissões (período)", "Demissões (período)",
                         "Turnover %", "Faltas mês", "Absenteísmo %", "Dias úteis mês"
                     ],
                     "Valor": [
                         sel_label, start_d.strftime("%d/%m/%Y"), end_d.strftime("%d/%m/%Y"),
                         hc_end, hc_start, round(hc_avg, 1),
                         ativo_count, deslig_count,
-                        n_adm, n_dem,
+                        n_adm, n_dem_period,
                         None if pd.isna(turnover) else round(float(turnover), 2),
                         faltas_total_mes,
                         None if pd.isna(abs_pct) else round(float(abs_pct), 2),
@@ -1118,4 +1143,4 @@ with tab_base:
                 st.exception(e)
 
     st.markdown("<hr>", unsafe_allow_html=True)
-    st.caption("Obs.: Heatmap diário depende de base com granularidade por dia." )
+    st.caption("Obs.: Heatmap diário depende de base com granularidade por dia.")
