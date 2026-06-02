@@ -841,9 +841,8 @@ with tab_abs:
 
     top = view.copy()
     top["FALTAS_MES"] = pd.to_numeric(top["FALTAS_MES"], errors="coerce").fillna(0).astype(int)
-    if "MOTIVO_FALTA" not in top.columns:
-        top["MOTIVO_FALTA"] = ""
-    top["MOTIVO_FALTA"] = top["MOTIVO_FALTA"].astype(str).str.strip()
+    top["MOTIVO_FALTA"] = top.get("MOTIVO_FALTA", "").astype(str).str.strip()
+    top["MOTIVO_FALTA"] = top["MOTIVO_FALTA"].replace({"": "Sem motivo informado", "nan": "Sem motivo informado", "None": "Sem motivo informado"})
     top = top[top["FALTAS_MES"] > 0].sort_values("FALTAS_MES", ascending=False).head(15)
 
     c1, c2 = st.columns(2)
@@ -853,59 +852,71 @@ with tab_abs:
         st.altair_chart(bar_with_labels(plot, "CIDADE", "ABS_%", height=340, title="Absenteísmo por cidade (%)", y_format=".2f"), use_container_width=True)
 
     with c2:
-        if len(top):
-            base = alt.Chart(top).encode(
-                x=alt.X("NOME:N", sort="-y", axis=alt.Axis(labelAngle=0, labelLimit=260), title=""),
-                y=alt.Y("FALTAS_MES:Q", title=""),
-                tooltip=["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "FALTAS_MES", "MOTIVO_FALTA"],
+        if not top.empty:
+            st.altair_chart(
+                bar_with_labels(
+                    top,
+                    "NOME",
+                    "FALTAS_MES",
+                    height=340,
+                    title="Top 15 faltas por colaborador (mês)",
+                    y_format=".0f",
+                ).encode(
+                    tooltip=["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "FALTAS_MES", "MOTIVO_FALTA"]
+                ),
+                use_container_width=True,
             )
-            chart = (
-                base.mark_bar()
-                + base.mark_text(dy=-6).encode(text=alt.Text("FALTAS_MES:Q", format=".0f"))
-            ).properties(height=340, title="Top 15 faltas por colaborador (mês)")
-            st.altair_chart(chart, use_container_width=True)
         else:
-            st.info("Sem colaboradores com faltas no mês/recorte.")
+            st.info("Sem colaboradores com faltas no recorte selecionado.")
 
     st.markdown("<div class='section'>Motivos das faltas</div>", unsafe_allow_html=True)
+    faltas_motivo = view.copy()
+    faltas_motivo["FALTAS_MES"] = pd.to_numeric(faltas_motivo["FALTAS_MES"], errors="coerce").fillna(0).astype(int)
+    faltas_motivo["MOTIVO_FALTA"] = faltas_motivo.get("MOTIVO_FALTA", "").astype(str).str.strip()
+    faltas_motivo = faltas_motivo[faltas_motivo["FALTAS_MES"] > 0].copy()
+    faltas_motivo["MOTIVO_FALTA"] = faltas_motivo["MOTIVO_FALTA"].replace({"": "Sem motivo informado", "nan": "Sem motivo informado", "None": "Sem motivo informado"})
 
-    faltantes = view.copy()
-    faltantes["FALTAS_MES"] = pd.to_numeric(faltantes["FALTAS_MES"], errors="coerce").fillna(0).astype(int)
-    if "MOTIVO_FALTA" not in faltantes.columns:
-        faltantes["MOTIVO_FALTA"] = ""
-    faltantes["MOTIVO_FALTA"] = faltantes["MOTIVO_FALTA"].astype(str).str.strip()
-    faltantes = faltantes[faltantes["FALTAS_MES"] > 0].copy()
-
-    if len(faltantes):
-        faltantes_det = faltantes[
-            ["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "FALTAS_MES", "MOTIVO_FALTA"]
-        ].copy()
-        faltantes_det = faltantes_det.sort_values(["FALTAS_MES", "NOME"], ascending=[False, True])
-
-        st.markdown("**Quem faltou e qual foi o motivo**")
-        st.dataframe(faltantes_det, use_container_width=True, hide_index=True)
-
-        motivo_base = faltantes.copy()
-        motivo_base["MOTIVO_FALTA_RESUMO"] = motivo_base["MOTIVO_FALTA"].replace("", "Sem motivo informado")
-        by_mot_falta = (
-            motivo_base.groupby("MOTIVO_FALTA_RESUMO")
+    if not faltas_motivo.empty:
+        by_motivo_falta = (
+            faltas_motivo.groupby("MOTIVO_FALTA")
             .agg(FALTAS=("FALTAS_MES", "sum"), COLABORADORES=("NOME", "nunique"))
             .reset_index()
-            .rename(columns={"MOTIVO_FALTA_RESUMO": "MOTIVO_FALTA"})
             .sort_values("FALTAS", ascending=False)
         )
 
-        col_m1, col_m2 = st.columns(2)
-        with col_m1:
+        det_faltas = faltas_motivo[["NOME", "CIDADE", "FUNCAO_PAD", "GERENTE", "FALTAS_MES", "MOTIVO_FALTA"]].copy()
+        det_faltas = det_faltas.rename(
+            columns={
+                "NOME": "COLABORADOR",
+                "FUNCAO_PAD": "FUNÇÃO",
+                "GERENTE": "GERENTE",
+                "FALTAS_MES": "TOTAL DE FALTAS",
+                "MOTIVO_FALTA": "MOTIVO DA FALTA",
+            }
+        )
+        det_faltas = det_faltas.sort_values(["TOTAL DE FALTAS", "COLABORADOR"], ascending=[False, True])
+
+        m1, m2 = st.columns([1.05, 1.25])
+        with m1:
             st.altair_chart(
-                bar_with_labels(by_mot_falta, "MOTIVO_FALTA", "FALTAS", height=320, title="Faltas por motivo", y_format=".0f"),
+                bar_with_labels(
+                    by_motivo_falta,
+                    "MOTIVO_FALTA",
+                    "FALTAS",
+                    height=340,
+                    title="Faltas por motivo",
+                    y_format=".0f",
+                ).encode(tooltip=["MOTIVO_FALTA", "FALTAS", "COLABORADORES"]),
                 use_container_width=True,
             )
-        with col_m2:
-            with st.expander("Resumo por motivo", expanded=True):
-                st.dataframe(by_mot_falta, use_container_width=True, hide_index=True)
+        with m2:
+            st.markdown("**Quem faltou e qual foi o motivo**")
+            st.dataframe(det_faltas, use_container_width=True, hide_index=True)
+
+        with st.expander("Resumo por motivo", expanded=False):
+            st.dataframe(by_motivo_falta, use_container_width=True, hide_index=True)
     else:
-        st.info("Sem faltas registradas no mês/recorte.")
+        st.info("Sem faltas registradas no recorte selecionado.")
 
     st.markdown("<div class='section'>Reincidência (comparando meses)</div>", unsafe_allow_html=True)
     hist = df.copy()
